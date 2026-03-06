@@ -1,0 +1,4 @@
+outputs/
+*.log
+*.tmp
+.scope-cache
