@@ -54,6 +54,29 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 is_positive_int() { [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; }
 is_valid_output_name() { [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]]; }
 
+normalize_target() {
+  local t="${1:-}"
+  t="${t#http://}"; t="${t#https://}"
+  t="${t%%/*}"; t="${t%%:*}"
+  printf '%s' "$t"
+}
+
+is_valid_target() {
+  local t="$(normalize_target "${1:-}")"
+  [[ -n "$t" ]] || return 1
+  [[ "$t" != *"/"* ]] || return 1
+  [[ "$t" != *".."* ]] || return 1
+  [[ "$t" =~ ^localhost$|^[A-Za-z0-9.-]+$|^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+safe_target_dirname() {
+  local t
+  t="$(normalize_target "${1:-}")"
+  t="$(printf '%s' "$t" | sed 's/[^A-Za-z0-9._-]/_/g')"
+  [[ -n "$t" ]] || t="target"
+  printf '%s' "$t"
+}
+
 # ---------- OS helpers ----------
 is_kali_or_debian_like() {
   [[ -f /etc/os-release ]] || return 1
@@ -94,7 +117,7 @@ preflight_checks() {
   [[ -n "${BASH_VERSION:-}" ]] || { echo "[!] This script must be run with bash."; return 1; }
   is_kali_or_debian_like || echo "[!] Warning: this script is primarily supported on Kali/Debian-like Linux."
 
-  local required_commands=(python3 grep sed awk sort xargs head find mktemp sha256sum)
+  local required_commands=(python3 grep sed awk sort xargs head find mktemp sha256sum timeout)
   local cmd
   for cmd in "${required_commands[@]}"; do
     command_exists "$cmd" || { echo "[!] Required command missing: $cmd"; return 1; }
@@ -165,17 +188,21 @@ ensure_seclists() {
 
   require_sudo_if_needed || return 1
 
-  echo "[*] apt install did not provide SecLists. Downloading archive from GitHub…"
+  local SECLISTS_REF="${SECLISTS_REF:-2025.2}"
+  echo "[*] apt install did not provide SecLists. Downloading pinned archive from GitHub (ref=$SECLISTS_REF)…"
   local tmp_root tmp_zip tmp_extract
   tmp_root="$(mktemp -d)"
   tmp_zip="$tmp_root/seclists.zip"
   tmp_extract="$tmp_root/extracted"
   mkdir -p "$tmp_extract"
 
-  if ! curl -L "https://github.com/danielmiessler/SecLists/archive/refs/heads/master.zip" -o "$tmp_zip"; then
-    echo "[!] Failed to download SecLists from GitHub."
-    rm -rf "$tmp_root"
-    return 1
+  if ! curl -L "https://github.com/danielmiessler/SecLists/archive/refs/tags/${SECLISTS_REF}.zip" -o "$tmp_zip"; then
+    echo "[!] Pinned SecLists ref failed; trying fallback pinned branch snapshot."
+    curl -L "https://github.com/danielmiessler/SecLists/archive/refs/heads/master.zip" -o "$tmp_zip" || {
+      echo "[!] Failed to download SecLists from GitHub."
+      rm -rf "$tmp_root"
+      return 1
+    }
   fi
 
   if ! unzip -q "$tmp_zip" -d "$tmp_extract"; then
@@ -269,10 +296,14 @@ install_dirsearch_kali_safe() {
 
   local tmp_clone
   tmp_clone="$(mktemp -d)"
-  if ! git clone https://github.com/maurosoria/dirsearch.git --depth 1 "$tmp_clone/dirsearch" >/dev/null 2>&1; then
-    echo "[!] Failed to clone dirsearch repository."
-    rm -rf "$tmp_clone"
-    return 1
+  local DIRSEARCH_GIT_REF="${DIRSEARCH_GIT_REF:-v0.4.3}"
+  if ! git clone --depth 1 --branch "$DIRSEARCH_GIT_REF" https://github.com/maurosoria/dirsearch.git "$tmp_clone/dirsearch" >/dev/null 2>&1; then
+    echo "[!] Pinned dirsearch ref ($DIRSEARCH_GIT_REF) clone failed; trying default branch fallback."
+    if ! git clone https://github.com/maurosoria/dirsearch.git --depth 1 "$tmp_clone/dirsearch" >/dev/null 2>&1; then
+      echo "[!] Failed to clone dirsearch repository."
+      rm -rf "$tmp_clone"
+      return 1
+    fi
   fi
 
   rm -rf "$DS_VENV"
@@ -346,9 +377,8 @@ install_go_tool() {
 
   command_exists "$binary" && return 0
 
-  if [[ $rc -ne 0 ]] && is_kali_or_debian_like && command_exists apt-get; then
-    echo "[!] Go install for $binary failed. Trying apt fallback…"
-    apt_install "$binary" >/dev/null 2>&1 || true
+  if [[ $rc -ne 0 ]]; then
+    echo "[!] Go install for $binary failed (no apt fallback to avoid wrong package mapping)."
   fi
 
   command_exists "$binary" || { echo "[!] Failed to install $binary"; return 1; }
@@ -490,15 +520,25 @@ if [[ $RESUME_MODE -eq 1 ]]; then
     TARGET="$(basename "$(dirname "$WORKDIR")" 2>/dev/null || true)"
     [[ -n "${TARGET:-}" ]] || TARGET="${WORKDIR##*/}"
   fi
+  TARGET="$(normalize_target "$TARGET")"
 else
   [[ -n "${TARGET:-}" ]] || usage_error
-  TARGET_DIR="$OUT_BASE/$TARGET"
+  TARGET="$(normalize_target "$TARGET")"
+fi
+
+is_valid_target "$TARGET" || { echo "[!] Invalid target: $TARGET"; exit 1; }
+TARGET_DIR="$OUT_BASE/$(safe_target_dirname "$TARGET")"
+
+if [[ $RESUME_MODE -eq 0 ]]; then
   RUN_NAME="${OUTPUT_NAME:-$(next_run_name "$TARGET_DIR")}"
   WORKDIR="$TARGET_DIR/$RUN_NAME"
 
   if [[ -e "$WORKDIR" ]]; then
     if [[ $OVERWRITE_OUTPUT -eq 1 ]]; then
-      echo "[*] Reusing existing output directory due to --overwrite: $WORKDIR"
+      echo "[*] Overwriting existing output directory: $WORKDIR"
+      rm -rf "$WORKDIR/.state" "$WORKDIR/intel" "$WORKDIR/urls" "$WORKDIR/ffuf" "$WORKDIR/dirsearch" "$WORKDIR/logs"
+      rm -f "$WORKDIR"/*.txt "$WORKDIR"/*.json "$WORKDIR"/*.jsonl "$WORKDIR"/*.md "$WORKDIR"/run_commands.sh
+      mkdir -p "$WORKDIR"
     elif [[ $AUTO_SUFFIX_OUTPUT -eq 1 ]]; then
       base_name="$RUN_NAME"
       i=2
@@ -769,6 +809,7 @@ NUCLEI_CONCURRENCY="${NUCLEI_CONCURRENCY:-50}"
 NUCLEI_MAX_HOST_ERROR="${NUCLEI_MAX_HOST_ERROR:-100}"
 PER_HOST_TIMEOUT_SEC="${PER_HOST_TIMEOUT_SEC:-300}"
 BACKOFF_TRIGGER_FAILURES="${BACKOFF_TRIGGER_FAILURES:-25}"
+DISCOVERY_PHASE_DEGRADED=0
 
 echo "[*] Recon for $TARGET"
 echo "[*] Output: $WORKDIR"
@@ -858,33 +899,42 @@ if ! is_done "httpx"; then
   init_output_files "$WORKDIR/httpx_results.txt" "$WORKDIR/httpx_results.json" "$WORKDIR/live_hosts.txt"
 
   if have_bin "$HTTPX_BIN"; then
-    run_cmd "httpx text" "\"$HTTPX_BIN\" -l \"$WORKDIR/resolved_subdomains.txt\" -silent -status-code -content-length -title -tech-detect -threads 200 -timeout 5 -retries 1 -o \"$WORKDIR/httpx_results.txt\" || true"
-    run_cmd "httpx json" "\"$HTTPX_BIN\" -l \"$WORKDIR/resolved_subdomains.txt\" -silent -json -tech-detect -threads 200 -timeout 5 -retries 1 -o \"$WORKDIR/httpx_results.json\" || true"
-    python3 - "$WORKDIR/httpx_results.json" "$WORKDIR/live_hosts.txt" <<'PY' || true
+    run_cmd "httpx json" "\"$HTTPX_BIN\" -l \"$WORKDIR/resolved_subdomains.txt\" -silent -json -status-code -content-length -title -tech-detect -threads 200 -timeout 5 -retries 1 -o \"$WORKDIR/httpx_results.json\" || true"
+    python3 - "$WORKDIR/httpx_results.json" "$WORKDIR/httpx_results.txt" "$WORKDIR/live_hosts.txt" <<'PY' || true
 import json, sys
-src, dst = sys.argv[1], sys.argv[2]
-hosts = []
+src, txt_out, live_out = sys.argv[1], sys.argv[2], sys.argv[3]
+live = set()
+text_lines = []
+# tighter live criteria: 2xx/3xx/401/403 only
+allowed = set([401, 403])
 try:
     with open(src, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            line = line.strip()
+            line=line.strip()
             if not line:
                 continue
             try:
-                obj = json.loads(line)
+                o=json.loads(line)
             except Exception:
                 continue
-            status = obj.get("status_code")
-            url = (obj.get("url") or obj.get("input") or "").strip()
-            if url and status != 400:
-                hosts.append(url)
+            url=(o.get("url") or o.get("input") or "").strip()
+            sc=o.get("status_code")
+            title=(o.get("title") or "").strip()
+            cl=o.get("content_length")
+            techs=",".join((o.get("tech") or [])[:5])
+            if url:
+                text_lines.append(f"[{sc}] {url} len={cl} title={title} tech={techs}")
+            if url and isinstance(sc, int) and ((200 <= sc < 400) or (sc in allowed)):
+                live.add(url)
 except FileNotFoundError:
     pass
-with open(dst, "w", encoding="utf-8") as f:
-    for host in sorted(set(hosts)):
-        f.write(host + "\n")
+with open(txt_out, "w", encoding="utf-8") as f:
+    f.write("\n".join(text_lines) + ("\n" if text_lines else ""))
+with open(live_out, "w", encoding="utf-8") as f:
+    for u in sorted(live):
+        f.write(u + "\n")
 PY
-    record_stage_status "httpx" "completed" "httpx probe attempted and live hosts derived from json"
+    record_stage_status "httpx" "completed" "single-pass httpx json; derived text + strict live hosts"
   else
     sed '/^$/d' "$WORKDIR/resolved_subdomains.txt" > "$WORKDIR/live_hosts.txt" || true
     record_stage_status "httpx" "fallback" "httpx missing; reused resolved hosts"
@@ -909,6 +959,7 @@ process_host_phase() {
   local FFUF_FILE_LOG="$WORKDIR/logs/${SAFE_NAME}.ffuf-files.log"
 
   local had_error=0 rc=0
+  local HOST_BASE="${HOST%/}"
 
   if [[ "$PHASE" == "dirsearch" ]]; then
     if [[ ! -s "$DS_OUT" ]]; then
@@ -937,7 +988,7 @@ process_host_phase() {
     if have_bin "$FFUF_BIN"; then
       if [[ "$PHASE" == "ffuf_dirs" && ! -s "$FFUF_DIR_OUT" ]]; then
         timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
-          "$FFUF_BIN" -u "$HOST/FUZZ" -w "$FFUF_DIR_WORDLIST" -t 40 -timeout 5 -rate 50 \
+          "$FFUF_BIN" -u "$HOST_BASE/FUZZ" -w "$FFUF_DIR_WORDLIST" -t 40 -timeout 5 -rate 50 \
           -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_DIR_OUT" >"$FFUF_DIR_LOG" 2>&1
         rc=$?
         if [[ $rc -ne 0 ]]; then
@@ -952,7 +1003,7 @@ process_host_phase() {
 
       if [[ "$PHASE" == "ffuf_files" && ! -s "$FFUF_FILE_OUT" ]]; then
         timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
-          "$FFUF_BIN" -u "$HOST/FUZZ" -w "$FFUF_FILE_WORDLIST" -t 40 -timeout 5 -rate 50 \
+          "$FFUF_BIN" -u "$HOST_BASE/FUZZ" -w "$FFUF_FILE_WORDLIST" -t 40 -timeout 5 -rate 50 \
           -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_FILE_OUT" >"$FFUF_FILE_LOG" 2>&1
         rc=$?
         if [[ $rc -ne 0 ]]; then
@@ -1023,7 +1074,15 @@ run_discovery_phase() {
     fi
   done
 
-  record_stage_status "discovery_$phase" "completed" "hosts=$total failures=$failures"
+  local status="completed"
+  if [[ "$failures" -gt 0 ]]; then
+    status="partial"
+  fi
+  if [[ "$total" -gt 0 && $(( failures * 100 / total )) -ge 50 ]]; then
+    status="degraded"
+    DISCOVERY_PHASE_DEGRADED=$((DISCOVERY_PHASE_DEGRADED + 1))
+  fi
+  record_stage_status "discovery_$phase" "$status" "hosts=$total failures=$failures"
 
   # Backoff if too noisy
   if [[ $failures -ge $BACKOFF_TRIGGER_FAILURES && $PARALLEL -gt 5 ]]; then
@@ -1051,7 +1110,11 @@ if ! is_done "discovery"; then
   run_discovery_phase "ffuf_files" "discovery_ffuf_files"
 
   normalize_dirsearch_reports
-  record_stage_status "discovery" "completed" "per-host dirsearch/ffuf attempted"
+  if [[ "$DISCOVERY_PHASE_DEGRADED" -gt 0 ]]; then
+    record_stage_status "discovery" "partial" "per-host discovery completed with degraded phases=$DISCOVERY_PHASE_DEGRADED"
+  else
+    record_stage_status "discovery" "completed" "per-host dirsearch/ffuf attempted"
+  fi
   mark_done "discovery"
 fi
 
