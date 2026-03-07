@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 #
 # reconHarvest.sh (Kali-friendly + resumable + scope-guarded + report-heavy)
-#
-# Runs only for lab targets or targets listed in scope.txt when --run is used.
 # Generates workspace + run_commands.sh always.
 #
 # Usage:
@@ -24,10 +22,7 @@ Usage:
 Notes:
   - Workspaces: outputs/<target>/<timestamp>/
   - --resume expects that folder path
-  - --run executes ONLY if:
-      * target is lab (localhost/127.0.0.1/*.local), OR
-      * target matches scope.txt (root domains or CIDRs)
-  - Put scope.txt next to this script (recommended for company use).
+  - --run executes the recon pipeline immediately
 
 Examples:
   ./reconHarvest.sh example.com
@@ -190,71 +185,6 @@ resolve_go_tool() {
 
 resolve_tool() { command -v "$1" 2>/dev/null || true; }
 
-# ---------- scope / run guard ----------
-is_lab_target_value() {
-  local t="$1"
-  [[ "$t" == "localhost" ]] && return 0
-  [[ "$t" == "127.0.0.1" ]] && return 0
-  [[ "$t" == *.local ]] && return 0
-  return 1
-}
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCOPE_FILE="$SCRIPT_DIR/scope.txt"
-
-scope_matches() {
-  local target="$1"
-  [[ -f "$SCOPE_FILE" ]] || return 1
-  command_exists python3 || return 1
-
-  python3 - "$target" "$SCOPE_FILE" <<'PY'
-import sys, re, ipaddress
-
-target = sys.argv[1].strip().lower()
-scope_file = sys.argv[2]
-
-def is_ip(s):
-    try:
-        ipaddress.ip_address(s)
-        return True
-    except Exception:
-        return False
-
-def norm_host(s):
-    s = s.strip().lower()
-    s = re.sub(r'^https?://', '', s)
-    s = s.split('/')[0]
-    s = s.split(':')[0]
-    return s
-
-t = norm_host(target)
-t_is_ip = is_ip(t)
-
-with open(scope_file, 'r', encoding='utf-8', errors='ignore') as f:
-    entries = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
-
-for e in entries:
-    e = e.strip().lower()
-    if '/' in e:
-        if t_is_ip:
-            try:
-                net = ipaddress.ip_network(e, strict=False)
-                ip = ipaddress.ip_address(t)
-                if ip in net:
-                    sys.exit(0)
-            except Exception:
-                pass
-        continue
-
-    e = norm_host(e)
-    if not e:
-        continue
-    if t == e or t.endswith("." + e):
-        sys.exit(0)
-
-sys.exit(1)
-PY
-}
 
 # ---------- args ----------
 RESUME_MODE=0
@@ -939,21 +869,8 @@ echo "[*] Generated: $RUNFILE"
 
 # ---------- run policy ----------
 if [[ "$DO_RUN" -eq 1 ]]; then
-  if is_lab_target_value "$TARGET"; then
-    echo "[*] LAB target detected ($TARGET) — running."
-    bash "$RUNFILE"
-    exit 0
-  fi
-
-  if scope_matches "$TARGET"; then
-    echo "[*] Target matches scope.txt — running."
-    bash "$RUNFILE"
-    exit 0
-  fi
-
-  echo "[!] Refusing to run: target does not match scope.txt and is not lab."
-  echo "    Add it to scope.txt (root domain or CIDR) or run against lab targets."
-  echo "    Workspace generated anyway: $WORKDIR"
+  echo "[*] Running recon for $TARGET…"
+  bash "$RUNFILE"
   exit 0
 fi
 
