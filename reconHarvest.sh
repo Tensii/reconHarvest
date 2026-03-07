@@ -400,6 +400,14 @@ resolve_go_tool() {
 
 resolve_tool() { command -v "$1" 2>/dev/null || true; }
 
+verify_tool() {
+  local bin="$1"; shift
+  local test_cmd="${*:-$1 --help}"
+  command -v "$bin" >/dev/null 2>&1 || { echo "[!] Tool not found after install: $bin"; return 1; }
+  timeout 8 bash -lc "$test_cmd" >/dev/null 2>&1 || { echo "[!] Tool failed verification: $bin"; return 1; }
+  return 0
+}
+
 next_run_name() {
   local target_dir="$1"
   local max=0
@@ -577,6 +585,14 @@ install_go_tool "katana"      go install -v github.com/projectdiscovery/katana/c
 install_go_tool "gau"         go install github.com/lc/gau/v2/cmd/gau@latest
 install_go_tool "nuclei"      go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 
+verify_tool dirsearch "dirsearch --help" || exit 1
+verify_tool ffuf "ffuf -h" || exit 1
+verify_tool httpx "httpx -h" || exit 1
+verify_tool dnsx "dnsx -h" || exit 1
+verify_tool katana "katana -h" || exit 1
+verify_tool gau "gau --help" || exit 1
+verify_tool nuclei "nuclei -h" || exit 1
+
 FFUF_BIN="$(resolve_go_tool ffuf)"
 HTTPX_BIN="$(resolve_go_tool httpx)"
 SUBFINDER_BIN="$(resolve_go_tool subfinder)"
@@ -621,6 +637,7 @@ STATE_DIR="__STATE_DIR__"
 COMMANDS_MD="__COMMANDS_MD__"
 STATUS_JSON="__STATUS_JSON__"
 ERRORS_JSON="__ERRORS_JSON__"
+FULL_EXEC_JSON="$WORKDIR/full_execution.jsonl"
 
 PARALLEL_OVERRIDE="__PARALLEL_OVERRIDE__"
 SKIP_NUCLEI="__SKIP_NUCLEI__"
@@ -721,6 +738,40 @@ with open(path, "a", encoding="utf-8") as f:
 PY
 }
 
+log_message() {
+  local level="$1" stage="$2" message="$3"
+  local ts
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  printf '[%s] [%s] %s: %s\n' "$ts" "$level" "$stage" "$message"
+  python3 - "$FULL_EXEC_JSON" "$ts" "$level" "$stage" "$message" <<'PY' || true
+import json, sys
+path, ts, level, stage, message = sys.argv[1:6]
+with open(path, 'a', encoding='utf-8') as f:
+    f.write(json.dumps({
+      'timestamp': ts,
+      'level': level,
+      'stage': stage,
+      'message': message,
+    }) + '\n')
+PY
+}
+
+retry_with_backoff() {
+  local max_attempts="${RETRY_MAX_ATTEMPTS:-3}"
+  local delay="${RETRY_INITIAL_DELAY_SEC:-1}"
+  local attempt=1
+  while (( attempt <= max_attempts )); do
+    "$@" && return 0
+    if (( attempt < max_attempts )); then
+      log_message "WARN" "retry" "attempt=${attempt} failed; retrying in ${delay}s: $*"
+      sleep "$delay"
+      delay=$(( delay * 2 ))
+    fi
+    attempt=$(( attempt + 1 ))
+  done
+  return 1
+}
+
 log_cmd() {
   local label="$1"; shift
   local cmd="$*"
@@ -738,7 +789,14 @@ run_cmd() {
   local label="$1"; shift
   local cmd="$*"
   log_cmd "$label" "$cmd"
-  bash -lc "$cmd"
+  log_message "INFO" "cmd" "start:$label"
+  if bash -lc "$cmd"; then
+    log_message "INFO" "cmd" "ok:$label"
+    return 0
+  fi
+  local rc=$?
+  log_message "ERROR" "cmd" "fail:$label rc=$rc"
+  return $rc
 }
 
 init_output_files() {
@@ -790,10 +848,32 @@ with open(out_path, "w", encoding="utf-8") as f:
 PY
 }
 
+deduplicate_endpoints() {
+  local out="$WORKDIR/intel/deduped_endpoints.txt"
+  {
+    cat "$WORKDIR/urls/urls_all.txt" 2>/dev/null || true
+    awk -F, 'NR>1 && $1 ~ /^https?:\/\// {print $1}' "$WORKDIR"/ffuf/*.csv 2>/dev/null || true
+    python3 - "$WORKDIR/intel/dirsearch_normalized.json" <<'PY' 2>/dev/null || true
+import json, sys
+p=sys.argv[1]
+try:
+  data=json.load(open(p,'r',encoding='utf-8'))
+  if isinstance(data, list):
+    for r in data:
+      u=str(r.get('url') or '').strip()
+      if u: print(u)
+except Exception:
+  pass
+PY
+  } | sed '/^\s*$/d' | sort -u > "$out"
+  log_message "INFO" "dedupe" "unique_endpoints=$(wc -l < \"$out\" 2>/dev/null || echo 0)"
+}
+
 mkdir -p "$WORKDIR/logs" "$WORKDIR/ffuf" "$WORKDIR/dirsearch" "$WORKDIR/urls" "$WORKDIR/intel" "$STATE_DIR"
 : > "$COMMANDS_MD" 2>/dev/null || true
 : > "$STATUS_JSON" 2>/dev/null || true
 : > "$ERRORS_JSON" 2>/dev/null || true
+: > "$FULL_EXEC_JSON" 2>/dev/null || true
 
 runner_preflight_checks
 
@@ -814,6 +894,7 @@ DISCOVERY_PHASE_DEGRADED=0
 echo "[*] Recon for $TARGET"
 echo "[*] Output: $WORKDIR"
 echo "[*] Parallel: $PARALLEL"
+log_message "INFO" "runner" "recon_started target=$TARGET parallel=$PARALLEL"
 
 # 0) nuclei templates update (best-effort, once)
 if ! is_done "nuclei_templates"; then
@@ -853,7 +934,7 @@ if ! is_done "dnsx"; then
   if have_bin "$DNSX_BIN"; then
     DNSX_RAW="$WORKDIR/dnsx_raw.txt"
     init_output_files "$DNSX_RAW"
-    run_cmd "dnsx" "\"$DNSX_BIN\" -l \"$WORKDIR/all_subdomains.txt\" -silent -o \"$DNSX_RAW\" || true"
+    retry_with_backoff run_cmd "dnsx" "\"$DNSX_BIN\" -l \"$WORKDIR/all_subdomains.txt\" -silent -o \"$DNSX_RAW\"" || true
     python3 - "$DNSX_RAW" "$WORKDIR/resolved_subdomains.txt" "$WORKDIR/intel/dns_host_ip_map.json" <<'PY' || true
 import json, re, sys
 raw_path, resolved_path, map_path = sys.argv[1:4]
@@ -899,7 +980,7 @@ if ! is_done "httpx"; then
   init_output_files "$WORKDIR/httpx_results.txt" "$WORKDIR/httpx_results.json" "$WORKDIR/live_hosts.txt"
 
   if have_bin "$HTTPX_BIN"; then
-    run_cmd "httpx json" "\"$HTTPX_BIN\" -l \"$WORKDIR/resolved_subdomains.txt\" -silent -json -status-code -content-length -title -tech-detect -threads 200 -timeout 5 -retries 1 -o \"$WORKDIR/httpx_results.json\" || true"
+    retry_with_backoff run_cmd "httpx json" "\"$HTTPX_BIN\" -l \"$WORKDIR/resolved_subdomains.txt\" -silent -json -status-code -content-length -title -tech-detect -threads 200 -timeout 5 -retries 1 -o \"$WORKDIR/httpx_results.json\"" || true
     python3 - "$WORKDIR/httpx_results.json" "$WORKDIR/httpx_results.txt" "$WORKDIR/live_hosts.txt" <<'PY' || true
 import json, sys
 src, txt_out, live_out = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -1124,10 +1205,10 @@ if ! is_done "urls"; then
   init_output_files "$WORKDIR/urls/katana_urls.txt" "$WORKDIR/urls/gau_urls.txt" "$WORKDIR/urls/urls_all.txt" "$WORKDIR/urls/urls_params.txt"
 
   if have_bin "$KATANA_BIN" && [[ -s "$WORKDIR/live_hosts.txt" ]]; then
-    run_cmd "katana" "\"$KATANA_BIN\" -list \"$WORKDIR/live_hosts.txt\" -silent -nc -kf all -o \"$WORKDIR/urls/katana_urls.txt\" || true"
+    retry_with_backoff run_cmd "katana" "\"$KATANA_BIN\" -list \"$WORKDIR/live_hosts.txt\" -silent -nc -kf all -o \"$WORKDIR/urls/katana_urls.txt\"" || true
   fi
   if have_bin "$GAU_BIN"; then
-    run_cmd "gau" "\"$GAU_BIN\" --subs \"$TARGET\" 2>/dev/null | sed '/^$/d' | sort -u > \"$WORKDIR/urls/gau_urls.txt\" || true"
+    retry_with_backoff run_cmd "gau" "\"$GAU_BIN\" --subs \"$TARGET\" 2>/dev/null | sed '/^$/d' | sort -u > \"$WORKDIR/urls/gau_urls.txt\"" || true
   fi
 
   cat "$WORKDIR/urls/katana_urls.txt" "$WORKDIR/urls/gau_urls.txt" 2>/dev/null | sed '/^$/d' | sort -u > "$WORKDIR/urls/urls_all.txt" || true
@@ -1490,6 +1571,8 @@ PY
   mark_done "endpoint_ranking"
 fi
 
+deduplicate_endpoints || true
+
 # 9) summary.md + summary.json
 echo "[*] Building summary.md…"
 SUMMARY_MD="$WORKDIR/summary.md"
@@ -1538,6 +1621,7 @@ print(f"- Legacy/version shortlist: `{os.path.join(workdir,'intel','hosts_with_l
 print(f"- DNS host→IP map: `{os.path.join(workdir,'intel','dns_host_ip_map.json')}`")
 print(f"- Normalized dirsearch data: `{os.path.join(workdir,'intel','dirsearch_normalized.json')}`")
 print(f"- Endpoint ranking: `{os.path.join(workdir,'intel','endpoints_ranked.md')}`")
+print(f"- Deduped endpoints: `{os.path.join(workdir,'intel','deduped_endpoints.txt')}`")
 print(f"- Stage status log: `{os.path.join(workdir,'stage_status.jsonl')}`\n")
 
 print("## Notes\n")
@@ -1584,10 +1668,12 @@ out = {
     "dns_host_ip_map_json": os.path.join(workdir,"intel","dns_host_ip_map.json"),
     "endpoints_ranked_md": os.path.join(workdir,"intel","endpoints_ranked.md"),
     "endpoints_ranked_json": os.path.join(workdir,"intel","endpoints_ranked.json"),
+    "deduped_endpoints_txt": os.path.join(workdir,"intel","deduped_endpoints.txt"),
   },
   "status": {
     "stage_status_jsonl": os.path.join(workdir,"stage_status.jsonl"),
     "errors_jsonl": os.path.join(workdir,"errors.jsonl"),
+    "full_execution_jsonl": os.path.join(workdir,"full_execution.jsonl"),
   },
   "artifacts": {
     "ffuf_csv": gl("ffuf/*.csv"),
