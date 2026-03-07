@@ -197,22 +197,43 @@ if [[ $# -lt 1 ]]; then usage; fi
 
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
-    --run) DO_RUN=1; shift ;;
+    --run)
+      DO_RUN=1
+      shift
+      ;;
+
     --parallel)
-      PARALLEL_OVERRIDE="${2:-}"
-      [[ -n "${PARALLEL_OVERRIDE:-}" ]] || { echo "[!] --parallel requires a value."; usage; }
+      [[ $# -ge 2 ]] || { echo "[!] --parallel requires a value."; usage; }
+      [[ "${2:-}" != --* ]] || { echo "[!] --parallel requires a numeric value, not another option."; usage; }
+      PARALLEL_OVERRIDE="$2"
       is_positive_int "$PARALLEL_OVERRIDE" || { echo "[!] --parallel must be a positive integer."; usage; }
       shift 2
       ;;
+
     --resume)
+      [[ $# -ge 2 ]] || { echo "[!] --resume requires a workdir."; usage; }
+      [[ "${2:-}" != --* ]] || { echo "[!] --resume requires a workdir, not another option."; usage; }
       RESUME_MODE=1
-      WORKDIR="${2:-}"
-      [[ -n "${WORKDIR:-}" ]] || { echo "[!] --resume requires a workdir."; usage; }
+      WORKDIR="$2"
       shift 2
       ;;
-    -h|--help) usage ;;
+
+    -h|--help)
+      usage
+      ;;
+
+    --*)
+      echo "[!] Unknown option: $1"
+      usage
+      ;;
+
     *)
-      [[ $RESUME_MODE -eq 0 && -z "${TARGET:-}" ]] && TARGET="$1"
+      if [[ $RESUME_MODE -eq 0 && -z "${TARGET:-}" ]]; then
+        TARGET="$1"
+      else
+        echo "[!] Unexpected extra argument: $1"
+        usage
+      fi
       shift
       ;;
   esac
