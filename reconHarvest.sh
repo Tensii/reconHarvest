@@ -752,8 +752,41 @@ if ! is_done "dnsx"; then
   echo "[*] DNS resolve…"
   init_output_files "$WORKDIR/resolved_subdomains.txt"
   if have_bin "$DNSX_BIN"; then
-    run_cmd "dnsx" "\"$DNSX_BIN\" -l \"$WORKDIR/all_subdomains.txt\" -silent -resp-only -o \"$WORKDIR/resolved_subdomains.txt\" || true"
-    record_stage_status "dnsx" "completed" "dnsx resolution attempted"
+    DNSX_RAW="$WORKDIR/dnsx_raw.txt"
+    init_output_files "$DNSX_RAW"
+    run_cmd "dnsx" "\"$DNSX_BIN\" -l \"$WORKDIR/all_subdomains.txt\" -silent -o \"$DNSX_RAW\" || true"
+    python3 - "$DNSX_RAW" "$WORKDIR/resolved_subdomains.txt" "$WORKDIR/intel/dns_host_ip_map.json" <<'PY' || true
+import json, re, sys
+raw_path, resolved_path, map_path = sys.argv[1:4]
+hosts = []
+mp = {}
+try:
+  with open(raw_path, 'r', encoding='utf-8', errors='ignore') as f:
+    for line in f:
+      line=line.strip()
+      if not line:
+        continue
+      # dnsx lines can be like:
+      # sub.example.com [1.2.3.4]
+      # sub.example.com A 1.2.3.4
+      parts=line.split()
+      host=parts[0].strip()
+      if host:
+        hosts.append(host)
+      ips=set(re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', line))
+      if host and ips:
+        mp.setdefault(host, set()).update(ips)
+except FileNotFoundError:
+  pass
+hosts=sorted(set(h for h in hosts if h))
+with open(resolved_path, 'w', encoding='utf-8') as f:
+  for h in hosts:
+    f.write(h + '\n')
+out={k: sorted(v) for k,v in sorted(mp.items())}
+with open(map_path, 'w', encoding='utf-8') as f:
+  json.dump(out, f, indent=2)
+PY
+    record_stage_status "dnsx" "completed" "dnsx resolution attempted (hostnames preserved)"
   else
     sed '/^$/d' "$WORKDIR/all_subdomains.txt" > "$WORKDIR/resolved_subdomains.txt" || true
     record_stage_status "dnsx" "fallback" "dnsx missing; copied subdomains as resolved hosts"
@@ -1381,6 +1414,7 @@ print(f"- Tech to hosts: `{os.path.join(workdir,'intel','tech_to_hosts.md')}`")
 print(f"- Webserver to hosts: `{os.path.join(workdir,'intel','webserver_to_hosts.md')}`")
 print(f"- Host tech mapping: `{os.path.join(workdir,'intel','tech_by_host.md')}`")
 print(f"- Legacy/version shortlist: `{os.path.join(workdir,'intel','hosts_with_legacy_versions.md')}`")
+print(f"- DNS host→IP map: `{os.path.join(workdir,'intel','dns_host_ip_map.json')}`")
 print(f"- Normalized dirsearch data: `{os.path.join(workdir,'intel','dirsearch_normalized.json')}`")
 print(f"- Endpoint ranking: `{os.path.join(workdir,'intel','endpoints_ranked.md')}`")
 print(f"- Stage status log: `{os.path.join(workdir,'stage_status.jsonl')}`\n")
@@ -1426,6 +1460,7 @@ out = {
     "tech_by_host_json": os.path.join(workdir,"intel","tech_by_host.json"),
     "hosts_with_legacy_versions_md": os.path.join(workdir,"intel","hosts_with_legacy_versions.md"),
     "dirsearch_normalized_json": os.path.join(workdir,"intel","dirsearch_normalized.json"),
+    "dns_host_ip_map_json": os.path.join(workdir,"intel","dns_host_ip_map.json"),
     "endpoints_ranked_md": os.path.join(workdir,"intel","endpoints_ranked.md"),
     "endpoints_ranked_json": os.path.join(workdir,"intel","endpoints_ranked.json"),
   },
