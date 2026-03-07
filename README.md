@@ -1,158 +1,191 @@
 # reconHarvest
-
 `reconHarvest` is a Kali-friendly reconnaissance orchestrator for authorized security testing.
 
-It automates practical recon workflows (subdomain discovery, host probing, content discovery, URL collection, lightweight vuln triage) while keeping output organized, resumable, and reviewable.
+It automates practical recon workflows such as subdomain discovery, host probing, content discovery, URL collection, and lightweight vulnerability triage, while keeping output organized, resumable, and easy to review.
 
-> ⚠️ **Legal & Ethics**
-> Use this tool **only** on systems you explicitly own or are authorized to test.
-> Unauthorized scanning/testing may be illegal.
 
----
+## Overview
+Many recon scripts are either too minimal for repeated use or too brittle once a workflow grows. `reconHarvest` is designed to be practical for real engagement prep:
 
-## Why reconHarvest?
+- resumable execution with stage markers
+- generated, reviewable command flow
+- organized workspace output per target and timestamp
+- automatic setup for common dependencies where possible
+- report-focused output for both humans and follow-up tooling
 
-Most recon scripts are either too basic or too fragile for repeated engagements.
+## Current behavior
+The current script:
 
-`reconHarvest` focuses on:
+- can generate a workspace without running active recon
+- can execute immediately with `--run`
+- supports resuming an existing workspace with `--resume`
+- validates arguments more strictly than before
+- logs stage status to `stage_status.jsonl`
+- normalizes dirsearch findings into `intel/dirsearch_normalized.json`
 
-- **Scope-aware execution**: run mode is guarded by lab-target checks or `scope.txt`
-- **Resumable runs**: step markers in `.state/` prevent redoing completed work
-- **Structured output**: consistent workspace layout per target + timestamp
-- **Evidence-first workflow**: command logging and report-heavy outputs
-- **Kali-friendly installation flow**: auto-installs common recon dependencies where possible
-
----
+Note: the script no longer enforces a `scope.txt` execution guard. If you need hard scoping controls, add them back as a local policy requirement before using the tool in sensitive environments.
 
 ## Features
-
-- Subdomain enumeration: `subfinder`, `assetfinder`
-- DNS resolution: `dnsx`
-- Live host/tech probe: `httpx`
+- Subdomain enumeration:
+  - `subfinder`
+  - `assetfinder`
+- DNS resolution:
+  - `dnsx`
+- Live host and technology probing:
+  - `httpx`
 - Content discovery:
   - `dirsearch`
-  - `ffuf` (directories and files)
-- URL discovery: `katana`, `gau`
-- Nuclei phase 1 scan (focused severity/tags)
+  - `ffuf` for directory and file discovery
+- URL discovery:
+  - `katana`
+  - `gau`
+- Focused nuclei phase 1 scan
 - Intelligence artifacts:
-  - parameter ranking (`params_ranked.md/json`)
-  - technology summary (`tech_summary.md/json`)
-  - endpoint ranking (`endpoints_ranked.md/json`)
-- Human + machine summaries:
-  - `summary.md`
-  - `summary.json`
-
----
+  - parameter ranking
+  - technology summary
+  - endpoint ranking
+  - normalized dirsearch output
+- Human-readable and machine-readable summaries
+- Stage status tracking across the generated runner
 
 ## Installation
-
-```bash
+```bash path=null start=null
 git clone https://github.com/Tensii/reconHarvest.git
 cd reconHarvest
 chmod +x reconHarvest.sh
 ```
 
-### Requirements
+## Requirements
+Minimum runtime expectations:
 
 - Bash 4+
 - Python 3
-- `gh` is **not required** to run the script itself
-- On Kali/Debian-like systems, the script can auto-install many tools with `apt`/`go`/`pipx`
+- Kali/Debian-like Linux is the intended environment
 
----
+The script can install or repair several dependencies automatically using:
+
+- `apt`
+- `go`
+- `pipx`
+
+It also checks for SecLists and will attempt:
+
+1. `apt install seclists`
+2. GitHub ZIP download fallback
+3. minimal bundled wordlist fallback if SecLists still is not usable
 
 ## Usage
-
-```bash
+```bash path=null start=null
 ./reconHarvest.sh <target>
 ./reconHarvest.sh --run <target>
 ./reconHarvest.sh --parallel <n> [--run] <target>
 ./reconHarvest.sh --resume <workdir> [--run]
 ```
 
-### Examples
-
-```bash
-# Generate workspace only (no active scanning)
+## Examples
+```bash path=null start=null
+# Generate the workspace only
 ./reconHarvest.sh example.com
 
-# Run recon for in-scope target or lab target
+# Generate and immediately run recon
 ./reconHarvest.sh --run example.com
 
-# Increase parallel workers
-./reconHarvest.sh --parallel 80 --run localhost
+# Run with a higher worker count
+./reconHarvest.sh --parallel 80 --run example.com
 
-# Resume previous run workspace
+# Resume an existing workspace
 ./reconHarvest.sh --resume outputs/example.com/20260218141912 --run
 ```
 
----
+## Output layout
+Each run creates a workspace in:
 
-## Scope Guard (`scope.txt`)
-
-When `--run` is used, execution is allowed only if:
-
-1. Target is a lab-style target (`localhost`, `127.0.0.1`, `*.local`), **or**
-2. Target matches entries in `scope.txt`.
-
-Create `scope.txt` next to the script:
-
-```txt
-# Domains
-example.com
-corp.internal
-
-# CIDRs
-10.10.0.0/16
-172.16.5.0/24
-```
-
-Matching supports:
-
-- root domain + subdomains
-- CIDR ranges (for IP targets)
-
----
-
-## Output Structure
-
-Each run creates:
-
-```txt
+```text
 outputs/<target>/<timestamp>/
 ```
 
-Common artifacts:
+Common artifacts include:
 
-- `run_commands.sh` - generated runnable workflow
-- `COMMANDS_USED.md` - logged commands for traceability
-- `all_subdomains.txt`, `resolved_subdomains.txt`, `live_hosts.txt`
-- `httpx_results.txt`, `httpx_results.json`
-- `ffuf/*.csv`, `dirsearch/*.txt`, `logs/*.log`
-- `urls/` (katana, gau, merged, params)
-- `intel/` (rankings + summaries)
-- `nuclei_phase1.txt`, `nuclei_phase1.jsonl`
-- `summary.md`, `summary.json`
+- `run_commands.sh` — generated runnable workflow
+- `COMMANDS_USED.md` — commands logged for traceability
+- `stage_status.jsonl` — per-stage completion, fallback, and skip states
+- `all_subdomains.txt`
+- `resolved_subdomains.txt`
+- `live_hosts.txt`
+- `httpx_results.txt`
+- `httpx_results.json`
+- `ffuf/*.csv`
+- `dirsearch/*.txt`
+- `logs/*.log`
+- `urls/`
+- `intel/params_ranked.md`
+- `intel/params_ranked.json`
+- `intel/tech_summary.md`
+- `intel/tech_summary.json`
+- `intel/dirsearch_normalized.json`
+- `intel/endpoints_ranked.md`
+- `intel/endpoints_ranked.json`
+- `nuclei_phase1.txt`
+- `nuclei_phase1.jsonl`
+- `summary.md`
+- `summary.json`
 
----
+## Stage model
+The generated runner executes in broad stages:
 
-## Operational Notes
+1. nuclei template update
+2. subdomain enumeration
+3. DNS resolution
+4. HTTP probing
+5. per-host discovery
+6. URL collection and parameter ranking
+7. technology correlation
+8. focused nuclei triage
+9. endpoint ranking
+10. summary generation
 
-- Empty nuclei output can be normal depending on target exposure and template filters.
-- For better performance, tune `--parallel` based on CPU/network constraints.
-- For enterprise usage, keep `scope.txt` under access control and change management.
+Completed stages are tracked in `.state/`, so resumed runs avoid repeating finished work unless you remove the marker files.
 
----
+## Tooling notes
+- `dirsearch` is installed via `pipx` and repaired if the environment is broken
+- several Go-based tools are installed automatically if missing
+- `httpx` live hosts are derived from JSON output rather than brittle text parsing
+- host-specific output names include a short hash suffix to avoid filename collisions
 
-## Roadmap Ideas
+## Operational notes
+- empty nuclei output can be normal if no matching findings exist for the chosen filters
+- if SecLists is unavailable, the script falls back to a minimal generated wordlist
+- the generated runner performs its own runtime checks before scanning
+- parallelism should be tuned to your system and network conditions
 
-- profile modes (`safe`, `normal`, `aggressive`)
-- optional notifications on completion/failure
-- tool version snapshot file per run
+## Limitations
+- designed primarily for Kali/Debian-like Linux environments
+- relies on a number of external tools and network access for auto-install behavior
+- does not currently enforce hard target scope restrictions by itself
+
+## Suggested workflow
+```bash path=null start=null
+# 1. Create workspace and inspect generated commands
+./reconHarvest.sh example.com
+
+# 2. Review outputs/<target>/<timestamp>/run_commands.sh
+
+# 3. Run it
+bash outputs/example.com/<timestamp>/run_commands.sh
+```
+
+Or run immediately:
+
+```bash path=null start=null
+./reconHarvest.sh --run example.com
+```
+
+## Roadmap ideas
+- profile modes such as `safe`, `normal`, and `aggressive`
+- optional notifications on completion or failure
+- version snapshot per run
 - wildcard DNS detection and filtering
-
----
+- optional separate config file for tunables
 
 ## Author
-
 Built by [@Tensii](https://github.com/Tensii)
