@@ -20,6 +20,7 @@ Usage:
   ./reconHarvest.sh --resume <workdir> [--run]
 
 Notes:
+  - Supported environment: bash on Kali/Debian-like Linux
   - Workspaces: outputs/<target>/<timestamp>/
   - --resume expects that folder path
   - --run executes the recon pipeline immediately
@@ -65,6 +66,34 @@ apt_install() {
   if command_exists sudo; then sudo apt-get install -y "$@"; else apt-get install -y "$@"; fi
 }
 
+ensure_system_tool() {
+  local binary="$1"
+  local apt_pkg="${2:-$1}"
+  command_exists "$binary" && return 0
+  if is_kali_or_debian_like && command_exists apt-get; then
+    echo "[*] Installing $binary via apt…"
+    apt_install "$apt_pkg" >/dev/null 2>&1 || true
+  fi
+  command_exists "$binary" || { echo "[!] Required tool missing: $binary"; return 1; }
+}
+
+preflight_checks() {
+  [[ -n "${BASH_VERSION:-}" ]] || { echo "[!] This script must be run with bash."; return 1; }
+  is_kali_or_debian_like || echo "[!] Warning: this script is primarily supported on Kali/Debian-like Linux."
+
+  local required_commands=(python3 grep sed awk sort xargs head find mktemp sha256sum)
+  local cmd
+  for cmd in "${required_commands[@]}"; do
+    command_exists "$cmd" || { echo "[!] Required command missing: $cmd"; return 1; }
+  done
+
+  if [[ -n "${WORKDIR:-}" ]]; then
+    mkdir -p "$WORKDIR" || { echo "[!] Failed to create workdir: $WORKDIR"; return 1; }
+    : > "$WORKDIR/.write_test" || { echo "[!] Workdir is not writable: $WORKDIR"; return 1; }
+    rm -f "$WORKDIR/.write_test"
+  fi
+}
+
 # ---------- install helpers ----------
 ensure_go() {
   command_exists go && return 0
@@ -101,14 +130,8 @@ ensure_seclists() {
     [[ -d "$web_content" ]] && return 0
   fi
 
-  command_exists curl || {
-    echo "[!] curl is required for GitHub fallback installation of SecLists."
-    return 1
-  }
-  command_exists unzip || {
-    echo "[!] unzip is required for GitHub fallback installation of SecLists."
-    return 1
-  }
+  ensure_system_tool curl curl || return 1
+  ensure_system_tool unzip unzip || return 1
 
   require_sudo_if_needed || return 1
 
@@ -324,7 +347,7 @@ else
 fi
 
 echo "[*] Working directory: $WORKDIR"
-command_exists python3 || { echo "[!] python3 is required. Install python3."; exit 1; }
+preflight_checks || exit 1
 
 # ---------- tool install ----------
 install_dirsearch_kali_safe
@@ -383,6 +406,7 @@ mkdir -p "$STATE_DIR"
 
 RUNFILE="$WORKDIR/run_commands.sh"
 COMMANDS_MD="$WORKDIR/COMMANDS_USED.md"
+STATUS_JSON="$WORKDIR/stage_status.jsonl"
 
 # ---------- generate run_commands.sh safely (literal heredoc) ----------
 cat > "$RUNFILE" <<'EOF'
@@ -393,6 +417,7 @@ TARGET="__TARGET__"
 WORKDIR="__WORKDIR__"
 STATE_DIR="__STATE_DIR__"
 COMMANDS_MD="__COMMANDS_MD__"
+STATUS_JSON="__STATUS_JSON__"
 
 PARALLEL_OVERRIDE="__PARALLEL_OVERRIDE__"
 
@@ -444,6 +469,21 @@ safe_name_for_host() {
 is_done() { [[ -f "$STATE_DIR/$1.done" ]]; }
 mark_done() { : > "$STATE_DIR/$1.done"; }
 
+record_stage_status() {
+  local stage="$1" status="$2" detail="${3:-}"
+  python3 - "$STATUS_JSON" "$stage" "$status" "$detail" <<'PY' || true
+import datetime, json, sys
+path, stage, status, detail = sys.argv[1:5]
+with open(path, "a", encoding="utf-8") as f:
+    f.write(json.dumps({
+        "timestamp": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "stage": stage,
+        "status": status,
+        "detail": detail,
+    }) + "\n")
+PY
+}
+
 log_cmd() {
   local label="$1"; shift
   local cmd="$*"
@@ -464,8 +504,58 @@ run_cmd() {
   bash -lc "$cmd"
 }
 
+init_output_files() {
+  local path
+  for path in "$@"; do
+    : > "$path"
+  done
+}
+
+write_missing_log() {
+  local message="$1"; shift
+  local path
+  for path in "$@"; do
+    printf '%s\n' "$message" > "$path"
+  done
+}
+
+normalize_dirsearch_reports() {
+  python3 - "$WORKDIR" <<'PY' || true
+import json, os, re, sys
+workdir = sys.argv[1]
+src_dir = os.path.join(workdir, "dirsearch")
+out_path = os.path.join(workdir, "intel", "dirsearch_normalized.json")
+os.makedirs(os.path.join(workdir, "intel"), exist_ok=True)
+rows = []
+if os.path.isdir(src_dir):
+    for fn in sorted(os.listdir(src_dir)):
+        if not fn.endswith(".txt"):
+            continue
+        path = os.path.join(src_dir, fn)
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.search(r'(?P<url>https?://\S+).*?\b(?P<status>[1-5][0-9]{2})\b', line)
+                if not m:
+                    m = re.search(r'(?P<status>[1-5][0-9]{2}).*?(?P<url>https?://\S+)', line)
+                if not m:
+                    continue
+                rows.append({
+                    "source_file": fn,
+                    "url": m.group("url").rstrip(".,;"),
+                    "status": m.group("status"),
+                    "raw": line,
+                })
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(rows, f, indent=2)
+PY
+}
+
 mkdir -p "$WORKDIR/logs" "$WORKDIR/ffuf" "$WORKDIR/dirsearch" "$WORKDIR/urls" "$WORKDIR/intel" "$STATE_DIR"
 : > "$COMMANDS_MD" 2>/dev/null || true
+: > "$STATUS_JSON" 2>/dev/null || true
 
 PARALLEL="${PARALLEL_OVERRIDE:-30}"
 if ! is_positive_int "$PARALLEL"; then
@@ -487,6 +577,9 @@ if ! is_done "nuclei_templates"; then
   if have_bin "$NUCLEI_BIN"; then
     echo "[*] Updating nuclei templates (best-effort)…"
     run_cmd "nuclei templates update" "\"$NUCLEI_BIN\" -update-templates -silent || true"
+    record_stage_status "nuclei_templates" "completed" "templates update attempted"
+  else
+    record_stage_status "nuclei_templates" "skipped" "nuclei missing"
   fi
   mark_done "nuclei_templates"
 fi
@@ -494,9 +587,7 @@ fi
 # 1) subdomains
 if ! is_done "subdomains"; then
   echo "[*] Subdomain enumeration…"
-  : > "$WORKDIR/subfinder.txt"
-  : > "$WORKDIR/assetfinder.txt"
-  : > "$WORKDIR/all_subdomains.txt"
+  init_output_files "$WORKDIR/subfinder.txt" "$WORKDIR/assetfinder.txt" "$WORKDIR/all_subdomains.txt"
 
   if have_bin "$SUBFINDER_BIN"; then
     run_cmd "subfinder" "\"$SUBFINDER_BIN\" -d \"$TARGET\" -all -silent -o \"$WORKDIR/subfinder.txt\" || true"
@@ -506,17 +597,20 @@ if ! is_done "subdomains"; then
   fi
 
   cat "$WORKDIR/subfinder.txt" "$WORKDIR/assetfinder.txt" | sed '/^$/d' | sort -u > "$WORKDIR/all_subdomains.txt" || true
+  record_stage_status "subdomains" "completed" "merged passive subdomain sources"
   mark_done "subdomains"
 fi
 
 # 2) dns resolve
 if ! is_done "dnsx"; then
   echo "[*] DNS resolve…"
-  : > "$WORKDIR/resolved_subdomains.txt"
+  init_output_files "$WORKDIR/resolved_subdomains.txt"
   if have_bin "$DNSX_BIN"; then
     run_cmd "dnsx" "\"$DNSX_BIN\" -l \"$WORKDIR/all_subdomains.txt\" -silent -resp-only -o \"$WORKDIR/resolved_subdomains.txt\" || true"
+    record_stage_status "dnsx" "completed" "dnsx resolution attempted"
   else
     sed '/^$/d' "$WORKDIR/all_subdomains.txt" > "$WORKDIR/resolved_subdomains.txt" || true
+    record_stage_status "dnsx" "fallback" "dnsx missing; copied subdomains as resolved hosts"
   fi
   mark_done "dnsx"
 fi
@@ -524,9 +618,7 @@ fi
 # 3) http probe + tech json
 if ! is_done "httpx"; then
   echo "[*] HTTP probing…"
-  : > "$WORKDIR/httpx_results.txt"
-  : > "$WORKDIR/httpx_results.json"
-  : > "$WORKDIR/live_hosts.txt"
+  init_output_files "$WORKDIR/httpx_results.txt" "$WORKDIR/httpx_results.json" "$WORKDIR/live_hosts.txt"
 
   if have_bin "$HTTPX_BIN"; then
     run_cmd "httpx text" "\"$HTTPX_BIN\" -l \"$WORKDIR/resolved_subdomains.txt\" -silent -status-code -content-length -title -tech-detect -threads 200 -timeout 5 -retries 1 -o \"$WORKDIR/httpx_results.txt\" || true"
@@ -555,8 +647,10 @@ with open(dst, "w", encoding="utf-8") as f:
     for host in sorted(set(hosts)):
         f.write(host + "\n")
 PY
+    record_stage_status "httpx" "completed" "httpx probe attempted and live hosts derived from json"
   else
     sed '/^$/d' "$WORKDIR/resolved_subdomains.txt" > "$WORKDIR/live_hosts.txt" || true
+    record_stage_status "httpx" "fallback" "httpx missing; reused resolved hosts"
   fi
   mark_done "httpx"
 fi
@@ -581,7 +675,7 @@ process_host() {
       "$DIRSEARCH_BIN" -u "$HOST" -w "$DIRSEARCH_WORDLIST" -e php,html,js,txt,asp,aspx,jsp \
         -t 40 --timeout 5 --delay 0.05 --plain-text-report "$DS_OUT" >"$DS_LOG" 2>&1 || true
     else
-      echo "[!] dirsearch missing" >"$DS_LOG"
+      write_missing_log "[!] dirsearch missing" "$DS_LOG"
     fi
   fi
 
@@ -595,8 +689,7 @@ process_host() {
         -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_FILE_OUT" >"$FFUF_FILE_LOG" 2>&1 || true
     fi
   else
-    echo "[!] ffuf missing" >"$FFUF_DIR_LOG"
-    echo "[!] ffuf missing" >"$FFUF_FILE_LOG"
+    write_missing_log "[!] ffuf missing" "$FFUF_DIR_LOG" "$FFUF_FILE_LOG"
   fi
 }
 
@@ -610,8 +703,12 @@ if ! is_done "discovery"; then
   echo "[*] Per-host discovery (parallel=$PARALLEL)…"
   if [[ -s "$WORKDIR/live_hosts.txt" ]]; then
     grep -v '^\s*$' "$WORKDIR/live_hosts.txt" | xargs -r -P "$PARALLEL" -I{} bash -lc 'process_host "{}"'
+    normalize_dirsearch_reports
+    record_stage_status "discovery" "completed" "per-host dirsearch/ffuf attempted"
   else
     echo "[!] live_hosts.txt empty; skipping."
+    normalize_dirsearch_reports
+    record_stage_status "discovery" "skipped" "no live hosts available"
   fi
   mark_done "discovery"
 fi
@@ -619,10 +716,7 @@ fi
 # 5) URL discovery (katana + gau) + params
 if ! is_done "urls"; then
   echo "[*] URL discovery…"
-  : > "$WORKDIR/urls/katana_urls.txt"
-  : > "$WORKDIR/urls/gau_urls.txt"
-  : > "$WORKDIR/urls/urls_all.txt"
-  : > "$WORKDIR/urls/urls_params.txt"
+  init_output_files "$WORKDIR/urls/katana_urls.txt" "$WORKDIR/urls/gau_urls.txt" "$WORKDIR/urls/urls_all.txt" "$WORKDIR/urls/urls_params.txt"
 
   if have_bin "$KATANA_BIN" && [[ -s "$WORKDIR/live_hosts.txt" ]]; then
     run_cmd "katana" "\"$KATANA_BIN\" -list \"$WORKDIR/live_hosts.txt\" -silent -nc -kf all -o \"$WORKDIR/urls/katana_urls.txt\" || true"
@@ -702,6 +796,7 @@ open(out_json, "w", encoding="utf-8").write(json.dumps({
 }, indent=2))
 PY
 
+  record_stage_status "urls" "completed" "katana/gau url collection and param ranking generated"
   mark_done "urls"
 fi
 
@@ -761,17 +856,20 @@ open(out_json,"w",encoding="utf-8").write(json.dumps({
   "status_top": status_cnt.most_common(100),
 }, indent=2))
 PY
+  record_stage_status "tech" "completed" "tech correlation generated from httpx json"
   mark_done "tech"
 fi
 
 # 7) Nuclei phase 1 (high/critical, selected tags)
 if ! is_done "nuclei_phase1"; then
   echo "[*] Nuclei phase 1 (high/critical + selected tags)…"
-  : > "$WORKDIR/nuclei_phase1.txt"
-  : > "$WORKDIR/nuclei_phase1.jsonl"
+  init_output_files "$WORKDIR/nuclei_phase1.txt" "$WORKDIR/nuclei_phase1.jsonl"
   if have_bin "$NUCLEI_BIN" && [[ -s "$WORKDIR/live_hosts.txt" ]]; then
     run_cmd "nuclei phase1 txt" "\"$NUCLEI_BIN\" -l \"$WORKDIR/live_hosts.txt\" -severity \"$NUCLEI_PHASE1_SEV\" -tags \"$NUCLEI_PHASE1_TAGS\" -silent -rl 50 -c \"$NUCLEI_CONCURRENCY\" -max-host-error \"$NUCLEI_MAX_HOST_ERROR\" -timeout 5 -retries 1 -o \"$WORKDIR/nuclei_phase1.txt\" || true"
     run_cmd "nuclei phase1 jsonl" "\"$NUCLEI_BIN\" -l \"$WORKDIR/live_hosts.txt\" -severity \"$NUCLEI_PHASE1_SEV\" -tags \"$NUCLEI_PHASE1_TAGS\" -silent -rl 50 -c \"$NUCLEI_CONCURRENCY\" -max-host-error \"$NUCLEI_MAX_HOST_ERROR\" -timeout 5 -retries 1 -jsonl -o \"$WORKDIR/nuclei_phase1.jsonl\" || true"
+    record_stage_status "nuclei_phase1" "completed" "phase1 nuclei scan attempted"
+  else
+    record_stage_status "nuclei_phase1" "skipped" "nuclei missing or no live hosts"
   fi
   mark_done "nuclei_phase1"
 fi
@@ -784,7 +882,7 @@ import os, re, csv, json, collections, sys
 workdir = sys.argv[1]
 urls_all = os.path.join(workdir, "urls", "urls_all.txt")
 ffuf_dir = os.path.join(workdir, "ffuf")
-dirsearch = os.path.join(workdir, "dirsearch")
+dirsearch_json = os.path.join(workdir, "intel", "dirsearch_normalized.json")
 
 out_md = os.path.join(workdir, "intel", "endpoints_ranked.md")
 out_json = os.path.join(workdir, "intel", "endpoints_ranked.json")
@@ -841,28 +939,22 @@ if os.path.isdir(ffuf_dir):
     if fn.endswith(".csv"):
       ingest_ffuf(os.path.join(ffuf_dir, fn), "ffuf")
 
-if os.path.isdir(dirsearch):
-  for fn in os.listdir(dirsearch):
-    if not fn.endswith(".txt"): continue
-    p=os.path.join(dirsearch,fn)
-    try:
-      for line in open(p,"r",encoding="utf-8",errors="ignore"):
-        line=line.strip()
-        if not line: continue
-        m = re.search(r'(?P<url>https?://\S+).*?\b(?P<status>[1-5][0-9]{2})\b', line)
-        if not m:
-          m = re.search(r'(?P<status>[1-5][0-9]{2}).*?(?P<url>https?://\S+)', line)
-        if not m:
-          continue
-        url=m.group("url").rstrip(".,;")
-        sc=m.group("status")
-        add=8
-        if sc.startswith("2"): add+=18
-        if sc.startswith("3"): add+=10
-        candidates[url]["score"] += add + score_url(url)
-        candidates[url]["sources"].add("dirsearch")
-    except Exception:
-      pass
+if os.path.exists(dirsearch_json):
+  try:
+    with open(dirsearch_json, "r", encoding="utf-8", errors="ignore") as f:
+      data = json.load(f)
+    for row in data:
+      url = str(row.get("url") or "").strip()
+      sc = str(row.get("status") or "").strip()
+      if not url or not sc:
+        continue
+      add=8
+      if sc.startswith("2"): add+=18
+      if sc.startswith("3"): add+=10
+      candidates[url]["score"] += add + score_url(url)
+      candidates[url]["sources"].add("dirsearch")
+  except Exception:
+    pass
 
 ranked = sorted(
   ((v["score"], u, sorted(v["sources"])) for u,v in candidates.items()),
@@ -880,6 +972,7 @@ open(out_json,"w",encoding="utf-8").write(json.dumps([
   {"score":score,"url":u,"sources":sources} for score,u,sources in ranked[:2000]
 ], indent=2))
 PY
+  record_stage_status "endpoint_ranking" "completed" "endpoint ranking generated"
   mark_done "endpoint_ranking"
 fi
 
@@ -924,7 +1017,9 @@ print(f"- Nuclei findings (phase1): **{count_lines(paths['nuclei_phase1'])}**\n"
 print("## Intelligence Views\n")
 print(f"- Param juice ranking: `{os.path.join(workdir,'intel','params_ranked.md')}`")
 print(f"- Tech summary: `{os.path.join(workdir,'intel','tech_summary.md')}`")
-print(f"- Endpoint ranking: `{os.path.join(workdir,'intel','endpoints_ranked.md')}`\n")
+print(f"- Normalized dirsearch data: `{os.path.join(workdir,'intel','dirsearch_normalized.json')}`")
+print(f"- Endpoint ranking: `{os.path.join(workdir,'intel','endpoints_ranked.md')}`")
+print(f"- Stage status log: `{os.path.join(workdir,'stage_status.jsonl')}`\n")
 
 print("## Notes\n")
 print("- Empty nuclei output can be normal if filters are tight (high/critical + limited tags) and there are no matching known issues.")
@@ -959,8 +1054,12 @@ out = {
     "params_ranked_json": os.path.join(workdir,"intel","params_ranked.json"),
     "tech_summary_md": os.path.join(workdir,"intel","tech_summary.md"),
     "tech_summary_json": os.path.join(workdir,"intel","tech_summary.json"),
+    "dirsearch_normalized_json": os.path.join(workdir,"intel","dirsearch_normalized.json"),
     "endpoints_ranked_md": os.path.join(workdir,"intel","endpoints_ranked.md"),
     "endpoints_ranked_json": os.path.join(workdir,"intel","endpoints_ranked.json"),
+  },
+  "status": {
+    "stage_status_jsonl": os.path.join(workdir,"stage_status.jsonl"),
   },
   "artifacts": {
     "ffuf_csv": gl("ffuf/*.csv"),
@@ -993,6 +1092,7 @@ replace_in_file "$RUNFILE" "__TARGET__" "$TARGET"
 replace_in_file "$RUNFILE" "__WORKDIR__" "$WORKDIR"
 replace_in_file "$RUNFILE" "__STATE_DIR__" "$STATE_DIR"
 replace_in_file "$RUNFILE" "__COMMANDS_MD__" "$COMMANDS_MD"
+replace_in_file "$RUNFILE" "__STATUS_JSON__" "$STATUS_JSON"
 replace_in_file "$RUNFILE" "__PARALLEL_OVERRIDE__" "${PARALLEL_OVERRIDE:-}"
 
 replace_in_file "$RUNFILE" "__FFUF_BIN__" "$FFUF_BIN"
@@ -1008,6 +1108,15 @@ replace_in_file "$RUNFILE" "__DIRSEARCH_BIN__" "$DIRSEARCH_BIN"
 replace_in_file "$RUNFILE" "__FFUF_DIR_WORDLIST__" "$FFUF_DIR_WORDLIST"
 replace_in_file "$RUNFILE" "__FFUF_FILE_WORDLIST__" "$FFUF_FILE_WORDLIST"
 replace_in_file "$RUNFILE" "__DIRSEARCH_WORDLIST__" "$DIRSEARCH_WORDLIST"
+
+python3 - "$RUNFILE" <<'PY'
+import pathlib, re, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding='utf-8', errors='ignore')
+leftovers = sorted(set(re.findall(r'__[A-Z0-9_]+__', text)))
+if leftovers:
+    raise SystemExit("[!] Unreplaced placeholders in runfile: " + ", ".join(leftovers))
+PY
 
 chmod +x "$RUNFILE"
 
