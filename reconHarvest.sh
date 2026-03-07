@@ -108,11 +108,28 @@ preflight_checks() {
 }
 
 # ---------- install helpers ----------
+ensure_go_bin_path() {
+  local gobin gopath
+  if command_exists go; then
+    gobin="$(go env GOBIN 2>/dev/null || true)"
+    gopath="$(go env GOPATH 2>/dev/null || true)"
+    if [[ -z "$gobin" && -n "$gopath" ]]; then
+      gobin="$gopath/bin"
+    fi
+  fi
+  [[ -z "$gobin" ]] && gobin="$HOME/go/bin"
+  case ":$PATH:" in
+    *":$gobin:"*) ;;
+    *) export PATH="$gobin:$PATH" ;;
+  esac
+}
+
 ensure_go() {
-  command_exists go && return 0
+  command_exists go && { ensure_go_bin_path; return 0; }
   echo "[*] Installing Go via apt…"
   is_kali_or_debian_like && apt_install golang
   command_exists go || { echo "[!] Go not found. Install Go and ensure GOPATH/bin is in PATH."; return 1; }
+  ensure_go_bin_path
 }
 
 ensure_pipx() {
@@ -446,6 +463,7 @@ fi
 
 echo "[*] Working directory: $WORKDIR"
 preflight_checks || exit 1
+ensure_go_bin_path
 
 # ---------- required datasets ----------
 ensure_seclists || { echo "[!] SecLists is required and could not be installed."; exit 1; }
@@ -532,7 +550,11 @@ if command -v go >/dev/null 2>&1; then
     GOPATH="$(go env GOPATH 2>/dev/null || true)"
     [[ -n "$GOPATH" ]] && GOBIN="$GOPATH/bin"
   fi
-  [[ -n "$GOBIN" ]] && export PATH="$GOBIN:$PATH"
+  [[ -z "$GOBIN" ]] && GOBIN="$HOME/go/bin"
+  case ":$PATH:" in
+    *":$GOBIN:"*) ;;
+    *) export PATH="$GOBIN:$PATH" ;;
+  esac
 fi
 
 have_bin() {
