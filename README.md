@@ -9,7 +9,7 @@ Many recon scripts are either too minimal for repeated use or too brittle once a
 
 - resumable execution with stage markers
 - generated, reviewable command flow
-- organized workspace output per target and timestamp
+- organized workspace output per target and run name
 - automatic setup for common dependencies where possible
 - report-focused output for both humans and follow-up tooling
 
@@ -20,10 +20,15 @@ The current script:
 - can execute immediately with `--run`
 - supports resuming an existing workspace with `--resume`
 - supports custom run names with `-o` / `--output`
+- supports collision handling with `--overwrite` and `--auto-suffix`
 - uses sequential run names per target by default such as `1`, `2`, `3`
 - validates arguments more strictly than before
+- supports nuclei controls: `--skip-nuclei`, `--nuclei-severity`, `--nuclei-tags`
 - logs stage status to `stage_status.jsonl`
+- logs per-host/tool failures to `errors.jsonl`
 - normalizes dirsearch findings into `intel/dirsearch_normalized.json`
+- has granular discovery resume markers and live progress output
+- includes per-host timeout guards and automatic parallel backoff on heavy failures
 
 Note: the script no longer enforces a `scope.txt` execution guard. If you need hard scoping controls, add them back as a local policy requirement before using the tool in sensitive environments.
 
@@ -86,13 +91,16 @@ It also checks for SecLists and will attempt:
 
 1. `apt install seclists`
 2. GitHub ZIP download fallback
-3. minimal bundled wordlist fallback if SecLists still is not usable
+
+If SecLists still cannot be installed, execution stops (SecLists is required).
 
 ## Usage
 ```bash path=null start=null
 ./reconHarvest.sh <target>
 ./reconHarvest.sh --run <target>
-./reconHarvest.sh [-o <name>] [--parallel <n>] [--run] <target>
+./reconHarvest.sh [-o <name>] [--parallel <n>] [--run] [--skip-nuclei] <target>
+./reconHarvest.sh [--overwrite|--auto-suffix] [-o <name>] <target>
+./reconHarvest.sh --nuclei-severity <levels> --nuclei-tags <tags> --run <target>
 ./reconHarvest.sh --resume <workdir> [--run]
 ```
 
@@ -108,6 +116,16 @@ It also checks for SecLists and will attempt:
 
 # Run with a higher worker count
 ./reconHarvest.sh --parallel 80 --run example.com
+
+# Skip nuclei for speed
+./reconHarvest.sh --skip-nuclei --run example.com
+
+# Override nuclei filters
+./reconHarvest.sh --nuclei-severity critical --nuclei-tags cves --run example.com
+
+# Reuse or auto-suffix output names
+./reconHarvest.sh --overwrite -o initial-pass example.com
+./reconHarvest.sh --auto-suffix -o initial-pass example.com
 
 # Resume an existing workspace
 ./reconHarvest.sh --resume outputs/example.com/2 --run
@@ -125,6 +143,7 @@ Common artifacts include:
 - `run_commands.sh` — generated runnable workflow
 - `COMMANDS_USED.md` — commands logged for traceability
 - `stage_status.jsonl` — per-stage completion, fallback, and skip states
+- `errors.jsonl` — structured stage/tool/host error records
 - `all_subdomains.txt`
 - `resolved_subdomains.txt`
 - `live_hosts.txt`
@@ -153,10 +172,10 @@ The generated runner executes in broad stages:
 2. subdomain enumeration
 3. DNS resolution
 4. HTTP probing
-5. per-host discovery
+5. per-host discovery (granular: `discovery_dirsearch`, `discovery_ffuf_dirs`, `discovery_ffuf_files`)
 6. URL collection and parameter ranking
 7. technology correlation
-8. focused nuclei triage
+8. focused nuclei triage (unless `--skip-nuclei`)
 9. endpoint ranking
 10. summary generation
 
@@ -170,8 +189,10 @@ Completed stages are tracked in `.state/`, so resumed runs avoid repeating finis
 
 ## Operational notes
 - empty nuclei output can be normal if no matching findings exist for the chosen filters
-- if SecLists is unavailable, the script falls back to a minimal generated wordlist
+- if SecLists is unavailable and cannot be installed, the script exits with an error
 - the generated runner performs its own runtime checks before scanning
+- per-host discovery uses timeout guards (to avoid long single-host stalls)
+- discovery can auto-back off parallelism when failures/timeouts spike
 - parallelism should be tuned to your system and network conditions
 
 ## Limitations
@@ -184,7 +205,7 @@ Completed stages are tracked in `.state/`, so resumed runs avoid repeating finis
 # 1. Create workspace and inspect generated commands
 ./reconHarvest.sh example.com
 # 2. Review outputs/<target>/1/run_commands.sh
-# 2. Review outputs/<target>/<timestamp>/run_commands.sh
+#    (or whichever run-name you selected)
 
 # 3. Run it
 bash outputs/example.com/1/run_commands.sh
