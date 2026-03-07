@@ -1089,6 +1089,104 @@ PY
   mark_done "tech"
 fi
 
+# 6b) Tech ↔ host mapping for actionable triage
+if ! is_done "tech_host_mapping"; then
+  echo "[*] Mapping tech/webservers to hosts…"
+  python3 - "$WORKDIR" <<'PY' || true
+import json, os, collections, sys
+workdir = sys.argv[1]
+httpx_json = os.path.join(workdir, "httpx_results.json")
+intel = os.path.join(workdir, "intel")
+os.makedirs(intel, exist_ok=True)
+
+tech_to_hosts = collections.defaultdict(set)
+ws_to_hosts = collections.defaultdict(set)
+host_rows = []
+
+if os.path.exists(httpx_json):
+  with open(httpx_json, "r", encoding="utf-8", errors="ignore") as f:
+    for line in f:
+      line=line.strip()
+      if not line:
+        continue
+      try:
+        o=json.loads(line)
+      except Exception:
+        continue
+      host=(o.get("url") or o.get("input") or "").strip()
+      if not host:
+        continue
+      techs=[str(t) for t in (o.get("tech") or []) if str(t).strip()]
+      ws=str(o.get("webserver") or "").strip()
+      sc=o.get("status_code")
+      for t in techs:
+        tech_to_hosts[t].add(host)
+      if ws:
+        ws_to_hosts[ws].add(host)
+      host_rows.append({
+        "host": host,
+        "status_code": sc,
+        "webserver": ws,
+        "tech": sorted(set(techs))
+      })
+
+# JSON outputs
+with open(os.path.join(intel, "tech_to_hosts.json"), "w", encoding="utf-8") as f:
+  json.dump({k: sorted(v) for k,v in sorted(tech_to_hosts.items(), key=lambda x: (-len(x[1]), x[0].lower()))}, f, indent=2)
+with open(os.path.join(intel, "webserver_to_hosts.json"), "w", encoding="utf-8") as f:
+  json.dump({k: sorted(v) for k,v in sorted(ws_to_hosts.items(), key=lambda x: (-len(x[1]), x[0].lower()))}, f, indent=2)
+with open(os.path.join(intel, "tech_by_host.json"), "w", encoding="utf-8") as f:
+  json.dump(sorted(host_rows, key=lambda x: x["host"]), f, indent=2)
+
+# Markdown outputs
+with open(os.path.join(intel, "tech_to_hosts.md"), "w", encoding="utf-8") as f:
+  f.write("# Technology → Hosts\n\n")
+  for tech, hosts in sorted(tech_to_hosts.items(), key=lambda x: (-len(x[1]), x[0].lower())):
+    f.write(f"## {tech} ({len(hosts)})\n")
+    for h in sorted(hosts):
+      f.write(f"- {h}\n")
+    f.write("\n")
+
+with open(os.path.join(intel, "webserver_to_hosts.md"), "w", encoding="utf-8") as f:
+  f.write("# Webserver → Hosts\n\n")
+  for ws, hosts in sorted(ws_to_hosts.items(), key=lambda x: (-len(x[1]), x[0].lower())):
+    f.write(f"## {ws} ({len(hosts)})\n")
+    for h in sorted(hosts):
+      f.write(f"- {h}\n")
+    f.write("\n")
+
+with open(os.path.join(intel, "tech_by_host.md"), "w", encoding="utf-8") as f:
+  f.write("# Host → Tech/Webserver\n\n")
+  f.write("| Host | Status | Webserver | Tech |\n|---|---:|---|---|\n")
+  for row in sorted(host_rows, key=lambda x: x["host"]):
+    host=row["host"].replace("|", "\\|")
+    ws=(row.get("webserver") or "").replace("|", "\\|")
+    tech=", ".join(row.get("tech") or []).replace("|", "\\|")
+    sc=row.get("status_code")
+    f.write(f"| {host} | {sc if sc is not None else ''} | {ws} | {tech} |\n")
+
+# legacy/version focused shortlist
+legacy_markers=("nginx/", "apache/", "iis/", "microsoft-iis/", "php/", "jquery:", "prototype")
+legacy=[]
+for row in host_rows:
+  ws=(row.get("webserver") or "").lower()
+  techs=[t.lower() for t in (row.get("tech") or [])]
+  blob=" ".join([ws] + techs)
+  if any(m in blob for m in legacy_markers):
+    legacy.append(row)
+
+with open(os.path.join(intel, "hosts_with_legacy_versions.md"), "w", encoding="utf-8") as f:
+  f.write("# Hosts with Versioned/Legacy-Looking Tech\n\n")
+  if not legacy:
+    f.write("_No obvious versioned/legacy signatures found._\n")
+  else:
+    for row in sorted(legacy, key=lambda x: x["host"]):
+      f.write(f"- {row['host']} | webserver={row.get('webserver') or '-'} | tech={', '.join(row.get('tech') or [])}\n")
+PY
+  record_stage_status "tech_host_mapping" "completed" "generated tech/webserver to host mapping"
+  mark_done "tech_host_mapping"
+fi
+
 # 7) Nuclei phase 1 (high/critical, selected tags)
 if ! is_done "nuclei_phase1"; then
   echo "[*] Nuclei phase 1 (severity=$NUCLEI_PHASE1_SEV tags=$NUCLEI_PHASE1_TAGS)…"
@@ -1248,6 +1346,10 @@ print(f"- Nuclei findings (phase1): **{count_lines(paths['nuclei_phase1'])}**\n"
 print("## Intelligence Views\n")
 print(f"- Param juice ranking: `{os.path.join(workdir,'intel','params_ranked.md')}`")
 print(f"- Tech summary: `{os.path.join(workdir,'intel','tech_summary.md')}`")
+print(f"- Tech to hosts: `{os.path.join(workdir,'intel','tech_to_hosts.md')}`")
+print(f"- Webserver to hosts: `{os.path.join(workdir,'intel','webserver_to_hosts.md')}`")
+print(f"- Host tech mapping: `{os.path.join(workdir,'intel','tech_by_host.md')}`")
+print(f"- Legacy/version shortlist: `{os.path.join(workdir,'intel','hosts_with_legacy_versions.md')}`")
 print(f"- Normalized dirsearch data: `{os.path.join(workdir,'intel','dirsearch_normalized.json')}`")
 print(f"- Endpoint ranking: `{os.path.join(workdir,'intel','endpoints_ranked.md')}`")
 print(f"- Stage status log: `{os.path.join(workdir,'stage_status.jsonl')}`\n")
@@ -1285,6 +1387,13 @@ out = {
     "params_ranked_json": os.path.join(workdir,"intel","params_ranked.json"),
     "tech_summary_md": os.path.join(workdir,"intel","tech_summary.md"),
     "tech_summary_json": os.path.join(workdir,"intel","tech_summary.json"),
+    "tech_to_hosts_md": os.path.join(workdir,"intel","tech_to_hosts.md"),
+    "tech_to_hosts_json": os.path.join(workdir,"intel","tech_to_hosts.json"),
+    "webserver_to_hosts_md": os.path.join(workdir,"intel","webserver_to_hosts.md"),
+    "webserver_to_hosts_json": os.path.join(workdir,"intel","webserver_to_hosts.json"),
+    "tech_by_host_md": os.path.join(workdir,"intel","tech_by_host.md"),
+    "tech_by_host_json": os.path.join(workdir,"intel","tech_by_host.json"),
+    "hosts_with_legacy_versions_md": os.path.join(workdir,"intel","hosts_with_legacy_versions.md"),
     "dirsearch_normalized_json": os.path.join(workdir,"intel","dirsearch_normalized.json"),
     "endpoints_ranked_md": os.path.join(workdir,"intel","endpoints_ranked.md"),
     "endpoints_ranked_json": os.path.join(workdir,"intel","endpoints_ranked.json"),
