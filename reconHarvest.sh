@@ -1033,17 +1033,26 @@ for k, n in cnt.items():
 scored.sort(reverse=True)
 
 md = []
-md.append("# Parameter Ranking (Juice)\n\n")
-md.append("Scoring = frequency + juicy bonus.\n\n")
-md.append("| Param | Count | Juicy | Examples |\n|---|---:|:---:|---|\n")
-for score,k,n,isj in scored[:80]:
-  ex = "<br>".join(esc_md(x) for x in examples[k])
-  md.append(f"| `{esc_md(k)}` | {n} | {'✅' if isj else ''} | {ex} |\n")
+md.append("# Parameter Ranking (Readable)\n\n")
+md.append(f"- Total unique params: **{len(cnt)}**\n")
+md.append(f"- Juicy/security-relevant params: **{sum(1 for k in cnt if k.lower() in juicy)}**\n\n")
+md.append("Legend: ✅ = security-relevant keyword match\n\n")
+
+for idx, (score,k,n,isj) in enumerate(scored, 1):
+  md.append(f"## {idx}. `{esc_md(k)}` {'✅' if isj else ''}\n")
+  md.append(f"- Count: **{n}**\n")
+  exs = examples.get(k, [])
+  if exs:
+    md.append("- Examples:\n")
+    for ex in exs:
+      ex = ex if len(ex) <= 180 else (ex[:177] + "...")
+      md.append(f"  - `{esc_md(ex)}`\n")
+  md.append("\n")
 
 open(out_md, "w", encoding="utf-8").write("".join(md))
 open(out_json, "w", encoding="utf-8").write(json.dumps({
   "total_unique_params": len(cnt),
-  "top": [{"param":k,"count":n,"juicy":(k.lower() in juicy)} for score,k,n,isj in scored[:200]]
+  "top": [{"param":k,"count":n,"juicy":(k.lower() in juicy)} for score,k,n,isj in scored]
 }, indent=2))
 PY
 
