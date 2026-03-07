@@ -19,6 +19,8 @@ The current script:
 - can generate a workspace without running active recon
 - can execute immediately with `--run`
 - supports resuming an existing workspace with `--resume`
+- supports custom run names with `-o` / `--output`
+- uses sequential run names per target by default such as `1`, `2`, `3`
 - validates arguments more strictly than before
 - logs stage status to `stage_status.jsonl`
 - normalizes dirsearch findings into `intel/dirsearch_normalized.json`
@@ -55,6 +57,18 @@ cd reconHarvest
 chmod +x reconHarvest.sh
 ```
 
+Default behavior:
+
+- first run for a target becomes `outputs/<target>/1/`
+- second run becomes `outputs/<target>/2/`
+- third run becomes `outputs/<target>/3/`
+
+If you want a readable name instead, use:
+
+```bash path=null start=null
+./reconHarvest.sh -o initial-pass example.com
+```
+
 ## Requirements
 Minimum runtime expectations:
 
@@ -78,30 +92,32 @@ It also checks for SecLists and will attempt:
 ```bash path=null start=null
 ./reconHarvest.sh <target>
 ./reconHarvest.sh --run <target>
-./reconHarvest.sh --parallel <n> [--run] <target>
+./reconHarvest.sh [-o <name>] [--parallel <n>] [--run] <target>
 ./reconHarvest.sh --resume <workdir> [--run]
 ```
 
 ## Examples
 ```bash path=null start=null
-# Generate the workspace only
+# Generate the first workspace for the target as outputs/example.com/1
 ./reconHarvest.sh example.com
 
 # Generate and immediately run recon
 ./reconHarvest.sh --run example.com
+# Use a custom workspace name
+./reconHarvest.sh -o initial-pass --run example.com
 
 # Run with a higher worker count
 ./reconHarvest.sh --parallel 80 --run example.com
 
 # Resume an existing workspace
-./reconHarvest.sh --resume outputs/example.com/20260218141912 --run
+./reconHarvest.sh --resume outputs/example.com/2 --run
 ```
 
 ## Output layout
 Each run creates a workspace in:
 
 ```text
-outputs/<target>/<timestamp>/
+outputs/<target>/<run-name>/
 ```
 
 Common artifacts include:
@@ -167,11 +183,11 @@ Completed stages are tracked in `.state/`, so resumed runs avoid repeating finis
 ```bash path=null start=null
 # 1. Create workspace and inspect generated commands
 ./reconHarvest.sh example.com
-
+# 2. Review outputs/<target>/1/run_commands.sh
 # 2. Review outputs/<target>/<timestamp>/run_commands.sh
 
 # 3. Run it
-bash outputs/example.com/<timestamp>/run_commands.sh
+bash outputs/example.com/1/run_commands.sh
 ```
 
 Or run immediately:

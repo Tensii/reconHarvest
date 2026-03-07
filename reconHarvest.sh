@@ -24,6 +24,7 @@ Notes:
   - Workspaces: outputs/<target>/<run-name>/
   - Default run names are sequential numbers: 1, 2, 3, ...
   - Use -o/--output to set a custom run name
+  - SecLists is required and will be installed before recon continues
   - --resume expects that folder path
   - --run executes the recon pipeline immediately
 
@@ -385,6 +386,9 @@ fi
 echo "[*] Working directory: $WORKDIR"
 preflight_checks || exit 1
 
+# ---------- required datasets ----------
+ensure_seclists || { echo "[!] SecLists is required and could not be installed."; exit 1; }
+
 # ---------- tool install ----------
 install_dirsearch_kali_safe
 install_go_tool "ffuf"        go install github.com/ffuf/ffuf/v2@latest
@@ -407,7 +411,6 @@ NUCLEI_BIN="$(resolve_go_tool nuclei)"
 DIRSEARCH_BIN="$(resolve_tool dirsearch)"
 
 # ---------- wordlists ----------
-ensure_seclists || echo "[!] SecLists unavailable; will fall back to bundled minimal wordlist if needed."
 SECLISTS_BASE="/usr/share/seclists/Discovery/Web-Content"
 RAFT_DIR="$SECLISTS_BASE/raft-medium-directories.txt"
 RAFT_FILES="$SECLISTS_BASE/raft-medium-files.txt"
@@ -418,24 +421,9 @@ FFUF_DIR_WORDLIST="$RAFT_DIR"; [[ -f "$FFUF_DIR_WORDLIST" ]] || FFUF_DIR_WORDLIS
 FFUF_FILE_WORDLIST="$RAFT_FILES"; [[ -f "$FFUF_FILE_WORDLIST" ]] || FFUF_FILE_WORDLIST="$COMMON"
 DIRSEARCH_WORDLIST="$DIRLIST_MED"; [[ -f "$DIRSEARCH_WORDLIST" ]] || DIRSEARCH_WORDLIST="$COMMON"
 
-if [[ ! -f "$FFUF_DIR_WORDLIST" || ! -f "$FFUF_FILE_WORDLIST" || ! -f "$DIRSEARCH_WORDLIST" ]]; then
-  cat > "$WORKDIR/minimal_wordlist.txt" <<'EOL'
-admin
-login
-uploads
-images
-css
-js
-api
-dashboard
-graphql
-swagger
-actuator
-EOL
-  [[ -f "$FFUF_DIR_WORDLIST" ]] || FFUF_DIR_WORDLIST="$WORKDIR/minimal_wordlist.txt"
-  [[ -f "$FFUF_FILE_WORDLIST" ]] || FFUF_FILE_WORDLIST="$WORKDIR/minimal_wordlist.txt"
-  [[ -f "$DIRSEARCH_WORDLIST" ]] || DIRSEARCH_WORDLIST="$WORKDIR/minimal_wordlist.txt"
-fi
+[[ -f "$FFUF_DIR_WORDLIST" ]] || { echo "[!] Missing required SecLists wordlist: $FFUF_DIR_WORDLIST"; exit 1; }
+[[ -f "$FFUF_FILE_WORDLIST" ]] || { echo "[!] Missing required SecLists wordlist: $FFUF_FILE_WORDLIST"; exit 1; }
+[[ -f "$DIRSEARCH_WORDLIST" ]] || { echo "[!] Missing required SecLists wordlist: $DIRSEARCH_WORDLIST"; exit 1; }
 
 STATE_DIR="$WORKDIR/.state"
 mkdir -p "$STATE_DIR"
@@ -523,7 +511,7 @@ import datetime, json, sys
 path, stage, status, detail = sys.argv[1:5]
 with open(path, "a", encoding="utf-8") as f:
     f.write(json.dumps({
-        "timestamp": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "stage": stage,
         "status": status,
         "detail": detail,
