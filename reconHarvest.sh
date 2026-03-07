@@ -211,63 +211,121 @@ ensure_seclists() {
   echo "[*] SecLists installed at $base"
 }
 
-# Robust dirsearch installer/repairer for pipx environments.
-# Fixes: ModuleNotFoundError: pkg_resources (needs setuptools inside the pipx venv).
+# Dirsearch installer with robust fallback:
+# 1) Use existing healthy global/local binary
+# 2) Try pipx install/repair
+# 3) Fallback: git clone -> venv install -> wrapper -> cleanup clone dir
 install_dirsearch_kali_safe() {
-  ensure_pipx
-  export PATH="$HOME/.local/bin:$PATH"
+  local DS_WRAPPER_LOCAL="$HOME/.local/bin/dirsearch"
+  local DS_WRAPPER_GLOBAL="/usr/local/bin/dirsearch"
+  local DS_VENV="$HOME/.local/share/dirsearch-venv"
 
-  # Helper: inject/upgrade setuptools (and wheel) inside the dirsearch pipx venv.
-  # Uses runpip because it's more reliable than inject in some environments.
+  # Prefer existing working wrapper(s)
+  if [[ -x "$DS_WRAPPER_GLOBAL" ]] && "$DS_WRAPPER_GLOBAL" --help >/dev/null 2>&1; then
+    echo "[*] Using $DS_WRAPPER_GLOBAL"
+    return 0
+  fi
+  if [[ -x "$DS_WRAPPER_LOCAL" ]] && "$DS_WRAPPER_LOCAL" --help >/dev/null 2>&1; then
+    echo "[*] Using $DS_WRAPPER_LOCAL"
+    return 0
+  fi
+  if command_exists dirsearch && dirsearch --help >/dev/null 2>&1; then
+    echo "[*] Using existing dirsearch from PATH"
+    return 0
+  fi
+
+  # Try pipx path first (best effort)
+  ensure_pipx || true
+  export PATH="$HOME/.local/bin:$PATH"
   _dirsearch_fix_venv() {
-    # Best-effort, keep quiet unless something is really broken.
     pipx runpip dirsearch install -U setuptools wheel >/dev/null 2>&1 || true
     pipx inject dirsearch setuptools >/dev/null 2>&1 || true
   }
 
-  if command_exists dirsearch; then
-    # dirsearch exists — repair venv deps (pkg_resources) without noise.
-    _dirsearch_fix_venv
-
-    # Smoke test: ensure pkg_resources import works inside the venv environment.
-    # If it still fails, recreate the venv.
-    if ! dirsearch --help >/dev/null 2>&1; then
-      echo "[!] dirsearch appears installed but broken. Recreating pipx venv…"
-      pipx uninstall dirsearch >/dev/null 2>&1 || true
-      pipx install dirsearch >/dev/null 2>&1 || pipx install dirsearch
+  if command_exists pipx; then
+    echo "[*] Attempting dirsearch via pipx…"
+    if pipx list 2>/dev/null | grep -qi '^package dirsearch'; then
+      _dirsearch_fix_venv
+      dirsearch --help >/dev/null 2>&1 || {
+        pipx uninstall dirsearch >/dev/null 2>&1 || true
+        pipx install dirsearch >/dev/null 2>&1 || true
+        _dirsearch_fix_venv
+      }
+    else
+      pipx install dirsearch >/dev/null 2>&1 || true
       _dirsearch_fix_venv
     fi
+  fi
 
-    command_exists dirsearch || {
-      echo "[!] dirsearch not found after repair. Try: export PATH=\$HOME/.local/bin:\$PATH"
-      return 1
-    }
+  if command_exists dirsearch && dirsearch --help >/dev/null 2>&1; then
+    echo "[*] dirsearch available via pipx"
     return 0
   fi
 
-  echo "[*] Installing dirsearch via pipx (Kali-safe)…"
-  if pipx list 2>/dev/null | grep -qi '^package dirsearch'; then
-    pipx upgrade dirsearch >/dev/null 2>&1 || true
-  else
-    pipx install dirsearch >/dev/null 2>&1 || pipx install dirsearch
+  # Final fallback requested: clone -> install in venv -> remove clone dir
+  echo "[*] Pipx dirsearch unavailable/broken. Installing from cloned repo fallback…"
+  ensure_system_tool git git || return 1
+  ensure_system_tool python3 python3 || return 1
+
+  local tmp_clone
+  tmp_clone="$(mktemp -d)"
+  if ! git clone https://github.com/maurosoria/dirsearch.git --depth 1 "$tmp_clone/dirsearch" >/dev/null 2>&1; then
+    echo "[!] Failed to clone dirsearch repository."
+    rm -rf "$tmp_clone"
+    return 1
   fi
 
-  # Ensure pkg_resources exists (setuptools) in the pipx venv
-  _dirsearch_fix_venv
-
-  # Validate it actually runs
-  if ! dirsearch --help >/dev/null 2>&1; then
-    echo "[!] dirsearch installed but not runnable. Recreating pipx venv…"
-    pipx uninstall dirsearch >/dev/null 2>&1 || true
-    pipx install dirsearch >/dev/null 2>&1 || pipx install dirsearch
-    _dirsearch_fix_venv
-  fi
-
-  command_exists dirsearch || {
-    echo "[!] dirsearch not found after pipx install. Try: export PATH=\$HOME/.local/bin:\$PATH"
+  rm -rf "$DS_VENV"
+  python3 -m venv "$DS_VENV" || { rm -rf "$tmp_clone"; return 1; }
+  "$DS_VENV/bin/pip" install -U pip setuptools wheel >/dev/null 2>&1 || true
+  "$DS_VENV/bin/pip" install -r "$tmp_clone/dirsearch/requirements.txt" >/dev/null 2>&1 || {
+    echo "[!] Failed to install dirsearch requirements in fallback venv."
+    rm -rf "$tmp_clone"
     return 1
   }
-  return 0
+
+  mkdir -p "$HOME/.local/bin"
+  cat > "$DS_WRAPPER_LOCAL" <<EOF
+#!/usr/bin/env bash
+exec "$DS_VENV/bin/python" "$tmp_clone/dirsearch/dirsearch.py" "\$@"
+EOF
+  chmod +x "$DS_WRAPPER_LOCAL"
+
+  # If sudo is available, also place a global wrapper
+  if command_exists sudo; then
+    sudo mkdir -p /usr/local/bin >/dev/null 2>&1 || true
+    sudo tee "$DS_WRAPPER_GLOBAL" >/dev/null <<EOF
+#!/usr/bin/env bash
+exec "$DS_VENV/bin/python" "$tmp_clone/dirsearch/dirsearch.py" "\$@"
+EOF
+    sudo chmod +x "$DS_WRAPPER_GLOBAL" >/dev/null 2>&1 || true
+  fi
+
+  # Move cloned repo into stable location inside venv parent, then remove temp dir
+  mkdir -p "$HOME/.local/share"
+  rm -rf "$HOME/.local/share/dirsearch-src"
+  mv "$tmp_clone/dirsearch" "$HOME/.local/share/dirsearch-src"
+  rm -rf "$tmp_clone"
+
+  # Repoint wrappers to stable source path and validate
+  sed -i "s|$tmp_clone/dirsearch|$HOME/.local/share/dirsearch-src|g" "$DS_WRAPPER_LOCAL" || true
+  if [[ -x "$DS_WRAPPER_GLOBAL" ]]; then
+    sudo sed -i "s|$tmp_clone/dirsearch|$HOME/.local/share/dirsearch-src|g" "$DS_WRAPPER_GLOBAL" || true
+  fi
+
+  hash -r || true
+  export PATH="$HOME/.local/bin:$PATH"
+  if [[ -x "$DS_WRAPPER_GLOBAL" ]] && "$DS_WRAPPER_GLOBAL" --help >/dev/null 2>&1; then
+    echo "[*] dirsearch installed via clone fallback: $DS_WRAPPER_GLOBAL"
+    return 0
+  fi
+  if [[ -x "$DS_WRAPPER_LOCAL" ]] && "$DS_WRAPPER_LOCAL" --help >/dev/null 2>&1; then
+    echo "[*] dirsearch installed via clone fallback: $DS_WRAPPER_LOCAL"
+    return 0
+  fi
+
+  echo "[!] dirsearch fallback install failed."
+  return 1
 }
 
 install_go_tool() {
