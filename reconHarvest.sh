@@ -454,6 +454,17 @@ have_bin() {
 
 is_positive_int() { [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; }
 
+runner_preflight_checks() {
+  local required_commands=(bash python3 sed sort xargs awk sha256sum)
+  local cmd
+  for cmd in "${required_commands[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+      echo "[!] Required command missing in runner environment: $cmd"
+      exit 1
+    }
+  done
+}
+
 safe_name_for_host() {
   local host="$1"
   local digest
@@ -556,6 +567,8 @@ PY
 mkdir -p "$WORKDIR/logs" "$WORKDIR/ffuf" "$WORKDIR/dirsearch" "$WORKDIR/urls" "$WORKDIR/intel" "$STATE_DIR"
 : > "$COMMANDS_MD" 2>/dev/null || true
 : > "$STATUS_JSON" 2>/dev/null || true
+
+runner_preflight_checks
 
 PARALLEL="${PARALLEL_OVERRIDE:-30}"
 if ! is_positive_int "$PARALLEL"; then
@@ -696,6 +709,7 @@ process_host() {
 export -f have_bin
 export -f is_positive_int
 export -f safe_name_for_host
+export -f write_missing_log
 export -f process_host
 export WORKDIR FFUF_BIN DIRSEARCH_BIN FFUF_DIR_WORDLIST FFUF_FILE_WORDLIST DIRSEARCH_WORDLIST
 
