@@ -87,6 +87,77 @@ ensure_pipx() {
   command_exists pipx || { echo "[!] pipx still not found after install."; return 1; }
 }
 
+ensure_seclists() {
+  local base="/usr/share/seclists"
+  local web_content="$base/Discovery/Web-Content"
+
+  [[ -d "$web_content" ]] && return 0
+
+  echo "[*] SecLists not found. Attempting installation…"
+
+  if is_kali_or_debian_like && command_exists apt-get; then
+    echo "[*] Trying apt install seclists…"
+    apt_install seclists >/dev/null 2>&1 || true
+    [[ -d "$web_content" ]] && return 0
+  fi
+
+  command_exists curl || {
+    echo "[!] curl is required for GitHub fallback installation of SecLists."
+    return 1
+  }
+  command_exists unzip || {
+    echo "[!] unzip is required for GitHub fallback installation of SecLists."
+    return 1
+  }
+
+  require_sudo_if_needed || return 1
+
+  echo "[*] apt install did not provide SecLists. Downloading archive from GitHub…"
+  local tmp_root tmp_zip tmp_extract
+  tmp_root="$(mktemp -d)"
+  tmp_zip="$tmp_root/seclists.zip"
+  tmp_extract="$tmp_root/extracted"
+  mkdir -p "$tmp_extract"
+
+  if ! curl -L "https://github.com/danielmiessler/SecLists/archive/refs/heads/master.zip" -o "$tmp_zip"; then
+    echo "[!] Failed to download SecLists from GitHub."
+    rm -rf "$tmp_root"
+    return 1
+  fi
+
+  if ! unzip -q "$tmp_zip" -d "$tmp_extract"; then
+    echo "[!] Failed to extract SecLists archive."
+    rm -rf "$tmp_root"
+    return 1
+  fi
+
+  local extracted_dir
+  extracted_dir="$(find "$tmp_extract" -mindepth 1 -maxdepth 1 -type d -name 'SecLists-*' | head -n 1)"
+  [[ -n "${extracted_dir:-}" ]] || {
+    echo "[!] Could not locate extracted SecLists directory."
+    rm -rf "$tmp_root"
+    return 1
+  }
+
+  if command_exists sudo; then
+    sudo rm -rf "$base"
+    sudo mkdir -p /usr/share
+    sudo mv "$extracted_dir" "$base"
+  else
+    rm -rf "$base"
+    mkdir -p /usr/share
+    mv "$extracted_dir" "$base"
+  fi
+
+  rm -rf "$tmp_root"
+  [[ -d "$web_content" ]] || {
+    echo "[!] SecLists installation completed, but expected Web-Content directory is still missing."
+    return 1
+  }
+
+  echo "[*] SecLists installed at $base"
+}
+
 # Robust dirsearch installer/repairer for pipx environments.
 # Fixes: ModuleNotFoundError: pkg_resources (needs setuptools inside the pipx venv).
 install_dirsearch_kali_safe() {
@@ -277,6 +348,7 @@ NUCLEI_BIN="$(resolve_go_tool nuclei)"
 DIRSEARCH_BIN="$(resolve_tool dirsearch)"
 
 # ---------- wordlists ----------
+ensure_seclists || echo "[!] SecLists unavailable; will fall back to bundled minimal wordlist if needed."
 SECLISTS_BASE="/usr/share/seclists/Discovery/Web-Content"
 RAFT_DIR="$SECLISTS_BASE/raft-medium-directories.txt"
 RAFT_FILES="$SECLISTS_BASE/raft-medium-files.txt"
