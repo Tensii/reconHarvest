@@ -6,7 +6,7 @@
 # Usage:
 #   ./reconHarvest.sh <target>
 #   ./reconHarvest.sh --run <target>
-#   ./reconHarvest.sh --parallel <n> [--run] <target>
+#   ./reconHarvest.sh [-o <name>] [--parallel <n>] [--run] <target>
 #   ./reconHarvest.sh --resume <workdir> [--run]
 #
 set -Eeuo pipefail
@@ -16,20 +16,23 @@ usage() {
 Usage:
   ./reconHarvest.sh <target>
   ./reconHarvest.sh --run <target>
-  ./reconHarvest.sh --parallel <n> [--run] <target>
+  ./reconHarvest.sh [-o <name>] [--parallel <n>] [--run] <target>
   ./reconHarvest.sh --resume <workdir> [--run]
 
 Notes:
   - Supported environment: bash on Kali/Debian-like Linux
-  - Workspaces: outputs/<target>/<timestamp>/
+  - Workspaces: outputs/<target>/<run-name>/
+  - Default run names are sequential numbers: 1, 2, 3, ...
+  - Use -o/--output to set a custom run name
   - --resume expects that folder path
   - --run executes the recon pipeline immediately
 
 Examples:
   ./reconHarvest.sh example.com
   ./reconHarvest.sh --run example.com
+  ./reconHarvest.sh -o initial-pass --run example.com
   ./reconHarvest.sh --parallel 80 --run localhost
-  ./reconHarvest.sh --resume outputs/example.com/20260218141912 --run
+  ./reconHarvest.sh --resume outputs/example.com/2 --run
 EOL
 }
 
@@ -40,6 +43,7 @@ usage_error() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 is_positive_int() { [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; }
+is_valid_output_name() { [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]]; }
 
 # ---------- OS helpers ----------
 is_kali_or_debian_like() {
@@ -282,6 +286,27 @@ resolve_go_tool() {
 
 resolve_tool() { command -v "$1" 2>/dev/null || true; }
 
+next_run_name() {
+  local target_dir="$1"
+  local max=0
+  local path base
+
+  [[ -d "$target_dir" ]] || {
+    printf '1\n'
+    return 0
+  }
+
+  for path in "$target_dir"/*; do
+    [[ -d "$path" ]] || continue
+    base="$(basename "$path")"
+    if [[ "$base" =~ ^[0-9]+$ ]] && (( base > max )); then
+      max="$base"
+    fi
+  done
+
+  printf '%s\n' "$((max + 1))"
+}
+
 
 # ---------- args ----------
 RESUME_MODE=0
@@ -289,12 +314,21 @@ DO_RUN=0
 TARGET=""
 WORKDIR=""
 PARALLEL_OVERRIDE=""
+OUTPUT_NAME=""
 
 if [[ $# -lt 1 ]]; then usage_error; fi
 
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
     --run) DO_RUN=1; shift ;;
+    -o|--output)
+      [[ $RESUME_MODE -eq 0 ]] || { echo "[!] -o/--output cannot be used with --resume."; usage_error; }
+      [[ $# -ge 2 ]] || { echo "[!] -o/--output requires a value."; usage_error; }
+      [[ "${2:-}" != -* ]] || { echo "[!] -o/--output requires a name, not another flag."; usage_error; }
+      OUTPUT_NAME="${2:-}"
+      is_valid_output_name "$OUTPUT_NAME" || { echo "[!] Output name may contain only letters, numbers, dots, underscores, and hyphens."; usage_error; }
+      shift 2
+      ;;
     --parallel)
       [[ $# -ge 2 ]] || { echo "[!] --parallel requires a value."; usage_error; }
       [[ "${2:-}" != -* ]] || { echo "[!] --parallel requires a numeric value, not another flag."; usage_error; }
@@ -341,8 +375,10 @@ if [[ $RESUME_MODE -eq 1 ]]; then
   fi
 else
   [[ -n "${TARGET:-}" ]] || usage_error
-  TIMESTAMP="$(date +%Y%m%d%H%M%S)"
-  WORKDIR="$OUT_BASE/$TARGET/$TIMESTAMP"
+  TARGET_DIR="$OUT_BASE/$TARGET"
+  RUN_NAME="${OUTPUT_NAME:-$(next_run_name "$TARGET_DIR")}"
+  WORKDIR="$TARGET_DIR/$RUN_NAME"
+  [[ ! -e "$WORKDIR" ]] || { echo "[!] Output directory already exists: $WORKDIR"; exit 1; }
   mkdir -p "$WORKDIR"
 fi
 
