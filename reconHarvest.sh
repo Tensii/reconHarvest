@@ -6,7 +6,7 @@
 # Usage:
 #   ./reconHarvest.sh <target>
 #   ./reconHarvest.sh --run <target>
-#   ./reconHarvest.sh [-o <name>] [--parallel <n>] [--run] <target>
+#   ./reconHarvest.sh [-o <name>] [--parallel <n>] [--run] [--skip-nuclei] <target>
 #   ./reconHarvest.sh --resume <workdir> [--run]
 #
 set -Eeuo pipefail
@@ -16,7 +16,8 @@ usage() {
 Usage:
   ./reconHarvest.sh <target>
   ./reconHarvest.sh --run <target>
-  ./reconHarvest.sh [-o <name>] [--parallel <n>] [--run] <target>
+  ./reconHarvest.sh [-o <name>] [--parallel <n>] [--run] [--skip-nuclei] <target>
+  ./reconHarvest.sh [--overwrite|--auto-suffix] [-o <name>] <target>
   ./reconHarvest.sh --resume <workdir> [--run]
 
 Notes:
@@ -27,12 +28,19 @@ Notes:
   - SecLists is required and will be installed before recon continues
   - --resume expects that folder path
   - --run executes the recon pipeline immediately
+  - --skip-nuclei skips nuclei phases
+  - --nuclei-severity / --nuclei-tags override default phase1 filters
+  - --overwrite allows reusing existing -o output folder
+  - --auto-suffix appends -2/-3 if chosen output folder exists
 
 Examples:
   ./reconHarvest.sh example.com
   ./reconHarvest.sh --run example.com
   ./reconHarvest.sh -o initial-pass --run example.com
   ./reconHarvest.sh --parallel 80 --run localhost
+  ./reconHarvest.sh --skip-nuclei --run example.com
+  ./reconHarvest.sh --nuclei-severity critical --nuclei-tags cves --run example.com
+  ./reconHarvest.sh --auto-suffix -o initial-pass --run example.com
   ./reconHarvest.sh --resume outputs/example.com/2 --run
 EOL
 }
@@ -316,12 +324,32 @@ TARGET=""
 WORKDIR=""
 PARALLEL_OVERRIDE=""
 OUTPUT_NAME=""
+OVERWRITE_OUTPUT=0
+AUTO_SUFFIX_OUTPUT=0
+SKIP_NUCLEI=0
+NUCLEI_SEV_OVERRIDE=""
+NUCLEI_TAGS_OVERRIDE=""
 
 if [[ $# -lt 1 ]]; then usage_error; fi
 
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
     --run) DO_RUN=1; shift ;;
+    --skip-nuclei) SKIP_NUCLEI=1; shift ;;
+    --nuclei-severity)
+      [[ $# -ge 2 ]] || { echo "[!] --nuclei-severity requires a value."; usage_error; }
+      [[ "${2:-}" != -* ]] || { echo "[!] --nuclei-severity requires a value, not another flag."; usage_error; }
+      NUCLEI_SEV_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --nuclei-tags)
+      [[ $# -ge 2 ]] || { echo "[!] --nuclei-tags requires a value."; usage_error; }
+      [[ "${2:-}" != -* ]] || { echo "[!] --nuclei-tags requires a value, not another flag."; usage_error; }
+      NUCLEI_TAGS_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --overwrite) OVERWRITE_OUTPUT=1; shift ;;
+    --auto-suffix) AUTO_SUFFIX_OUTPUT=1; shift ;;
     -o|--output)
       [[ $RESUME_MODE -eq 0 ]] || { echo "[!] -o/--output cannot be used with --resume."; usage_error; }
       [[ $# -ge 2 ]] || { echo "[!] -o/--output requires a value."; usage_error; }
@@ -368,6 +396,19 @@ done
 
 OUT_BASE="outputs"
 
+if [[ $RESUME_MODE -eq 1 && $OVERWRITE_OUTPUT -eq 1 ]]; then
+  echo "[!] --overwrite cannot be used with --resume."
+  usage_error
+fi
+if [[ $RESUME_MODE -eq 1 && $AUTO_SUFFIX_OUTPUT -eq 1 ]]; then
+  echo "[!] --auto-suffix cannot be used with --resume."
+  usage_error
+fi
+if [[ $OVERWRITE_OUTPUT -eq 1 && $AUTO_SUFFIX_OUTPUT -eq 1 ]]; then
+  echo "[!] Use either --overwrite or --auto-suffix, not both."
+  usage_error
+fi
+
 if [[ $RESUME_MODE -eq 1 ]]; then
   [[ -d "$WORKDIR" ]] || { echo "[!] Resume folder not found: $WORKDIR"; exit 1; }
   if [[ -z "${TARGET:-}" ]]; then
@@ -379,8 +420,28 @@ else
   TARGET_DIR="$OUT_BASE/$TARGET"
   RUN_NAME="${OUTPUT_NAME:-$(next_run_name "$TARGET_DIR")}"
   WORKDIR="$TARGET_DIR/$RUN_NAME"
-  [[ ! -e "$WORKDIR" ]] || { echo "[!] Output directory already exists: $WORKDIR"; exit 1; }
-  mkdir -p "$WORKDIR"
+
+  if [[ -e "$WORKDIR" ]]; then
+    if [[ $OVERWRITE_OUTPUT -eq 1 ]]; then
+      echo "[*] Reusing existing output directory due to --overwrite: $WORKDIR"
+    elif [[ $AUTO_SUFFIX_OUTPUT -eq 1 ]]; then
+      base_name="$RUN_NAME"
+      i=2
+      while [[ -e "$TARGET_DIR/${base_name}-$i" ]]; do
+        i=$((i+1))
+      done
+      RUN_NAME="${base_name}-$i"
+      WORKDIR="$TARGET_DIR/$RUN_NAME"
+      echo "[*] Output exists, using auto-suffixed directory: $WORKDIR"
+      mkdir -p "$WORKDIR"
+    else
+      echo "[!] Output directory already exists: $WORKDIR"
+      echo "    Use --overwrite to reuse it or --auto-suffix to create a new name."
+      exit 1
+    fi
+  else
+    mkdir -p "$WORKDIR"
+  fi
 fi
 
 echo "[*] Working directory: $WORKDIR"
@@ -431,6 +492,7 @@ mkdir -p "$STATE_DIR"
 RUNFILE="$WORKDIR/run_commands.sh"
 COMMANDS_MD="$WORKDIR/COMMANDS_USED.md"
 STATUS_JSON="$WORKDIR/stage_status.jsonl"
+ERRORS_JSON="$WORKDIR/errors.jsonl"
 
 # ---------- generate run_commands.sh safely (literal heredoc) ----------
 cat > "$RUNFILE" <<'EOF'
@@ -442,8 +504,12 @@ WORKDIR="__WORKDIR__"
 STATE_DIR="__STATE_DIR__"
 COMMANDS_MD="__COMMANDS_MD__"
 STATUS_JSON="__STATUS_JSON__"
+ERRORS_JSON="__ERRORS_JSON__"
 
 PARALLEL_OVERRIDE="__PARALLEL_OVERRIDE__"
+SKIP_NUCLEI="__SKIP_NUCLEI__"
+NUCLEI_SEV_OVERRIDE="__NUCLEI_SEV_OVERRIDE__"
+NUCLEI_TAGS_OVERRIDE="__NUCLEI_TAGS_OVERRIDE__"
 
 FFUF_BIN="__FFUF_BIN__"
 HTTPX_BIN="__HTTPX_BIN__"
@@ -479,7 +545,7 @@ have_bin() {
 is_positive_int() { [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; }
 
 runner_preflight_checks() {
-  local required_commands=(bash python3 sed sort xargs awk sha256sum)
+  local required_commands=(bash python3 sed sort xargs awk sha256sum timeout)
   local cmd
   for cmd in "${required_commands[@]}"; do
     command -v "$cmd" >/dev/null 2>&1 || {
@@ -515,6 +581,22 @@ with open(path, "a", encoding="utf-8") as f:
         "stage": stage,
         "status": status,
         "detail": detail,
+    }) + "\n")
+PY
+}
+
+record_error() {
+  local stage="$1" tool="$2" host="$3" message="$4"
+  python3 - "$ERRORS_JSON" "$stage" "$tool" "$host" "$message" <<'PY' || true
+import datetime, json, sys
+path, stage, tool, host, message = sys.argv[1:6]
+with open(path, "a", encoding="utf-8") as f:
+    f.write(json.dumps({
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "stage": stage,
+        "tool": tool,
+        "host": host,
+        "message": message,
     }) + "\n")
 PY
 }
@@ -591,6 +673,7 @@ PY
 mkdir -p "$WORKDIR/logs" "$WORKDIR/ffuf" "$WORKDIR/dirsearch" "$WORKDIR/urls" "$WORKDIR/intel" "$STATE_DIR"
 : > "$COMMANDS_MD" 2>/dev/null || true
 : > "$STATUS_JSON" 2>/dev/null || true
+: > "$ERRORS_JSON" 2>/dev/null || true
 
 runner_preflight_checks
 
@@ -600,10 +683,12 @@ if ! is_positive_int "$PARALLEL"; then
   exit 1
 fi
 
-NUCLEI_PHASE1_SEV="high,critical"
-NUCLEI_PHASE1_TAGS="cves,misconfig,login,token-spray"
+NUCLEI_PHASE1_SEV="${NUCLEI_SEV_OVERRIDE:-high,critical}"
+NUCLEI_PHASE1_TAGS="${NUCLEI_TAGS_OVERRIDE:-cves,misconfig,login,token-spray}"
 NUCLEI_CONCURRENCY="${NUCLEI_CONCURRENCY:-50}"
 NUCLEI_MAX_HOST_ERROR="${NUCLEI_MAX_HOST_ERROR:-100}"
+PER_HOST_TIMEOUT_SEC="${PER_HOST_TIMEOUT_SEC:-300}"
+BACKOFF_TRIGGER_FAILURES="${BACKOFF_TRIGGER_FAILURES:-25}"
 
 echo "[*] Recon for $TARGET"
 echo "[*] Output: $WORKDIR"
@@ -611,7 +696,9 @@ echo "[*] Parallel: $PARALLEL"
 
 # 0) nuclei templates update (best-effort, once)
 if ! is_done "nuclei_templates"; then
-  if have_bin "$NUCLEI_BIN"; then
+  if [[ "$SKIP_NUCLEI" == "1" ]]; then
+    record_stage_status "nuclei_templates" "skipped" "skip-nuclei enabled"
+  elif have_bin "$NUCLEI_BIN"; then
     echo "[*] Updating nuclei templates (best-effort)…"
     run_cmd "nuclei templates update" "\"$NUCLEI_BIN\" -update-templates -silent || true"
     record_stage_status "nuclei_templates" "completed" "templates update attempted"
@@ -693,8 +780,9 @@ PY
 fi
 
 # 4) per-host discovery
-process_host() {
+process_host_phase() {
   local HOST="$1"
+  local PHASE="$2" # dirsearch|ffuf_dirs|ffuf_files
   [[ -z "$HOST" ]] && return 0
   local SAFE_NAME
   SAFE_NAME="$(safe_name_for_host "$HOST")"
@@ -707,47 +795,150 @@ process_host() {
   local FFUF_DIR_LOG="$WORKDIR/logs/${SAFE_NAME}.ffuf-dirs.log"
   local FFUF_FILE_LOG="$WORKDIR/logs/${SAFE_NAME}.ffuf-files.log"
 
-  if [[ ! -s "$DS_OUT" ]]; then
-    if have_bin "$DIRSEARCH_BIN"; then
-      "$DIRSEARCH_BIN" -u "$HOST" -w "$DIRSEARCH_WORDLIST" -e php,html,js,txt,asp,aspx,jsp \
-        -t 40 --timeout 5 --delay 0.05 --plain-text-report "$DS_OUT" >"$DS_LOG" 2>&1 || true
-    else
-      write_missing_log "[!] dirsearch missing" "$DS_LOG"
+  local had_error=0 rc=0
+
+  if [[ "$PHASE" == "dirsearch" ]]; then
+    if [[ ! -s "$DS_OUT" ]]; then
+      if have_bin "$DIRSEARCH_BIN"; then
+        timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
+          "$DIRSEARCH_BIN" -u "$HOST" -w "$DIRSEARCH_WORDLIST" -e php,html,js,txt,asp,aspx,jsp \
+          -t 40 --timeout 5 --delay 0.05 --plain-text-report "$DS_OUT" >"$DS_LOG" 2>&1
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+          had_error=1
+          if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+            record_error "discovery" "dirsearch" "$HOST" "timeout"
+          else
+            record_error "discovery" "dirsearch" "$HOST" "exit_code=$rc"
+          fi
+        fi
+      else
+        write_missing_log "[!] dirsearch missing" "$DS_LOG"
+        record_error "discovery" "dirsearch" "$HOST" "binary_missing"
+        had_error=1
+      fi
     fi
   fi
 
-  if have_bin "$FFUF_BIN"; then
-    if [[ ! -s "$FFUF_DIR_OUT" ]]; then
-      "$FFUF_BIN" -u "$HOST/FUZZ" -w "$FFUF_DIR_WORDLIST" -t 40 -timeout 5 -rate 50 \
-        -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_DIR_OUT" >"$FFUF_DIR_LOG" 2>&1 || true
+  if [[ "$PHASE" == "ffuf_dirs" || "$PHASE" == "ffuf_files" ]]; then
+    if have_bin "$FFUF_BIN"; then
+      if [[ "$PHASE" == "ffuf_dirs" && ! -s "$FFUF_DIR_OUT" ]]; then
+        timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
+          "$FFUF_BIN" -u "$HOST/FUZZ" -w "$FFUF_DIR_WORDLIST" -t 40 -timeout 5 -rate 50 \
+          -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_DIR_OUT" >"$FFUF_DIR_LOG" 2>&1
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+          had_error=1
+          if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+            record_error "discovery" "ffuf_dirs" "$HOST" "timeout"
+          else
+            record_error "discovery" "ffuf_dirs" "$HOST" "exit_code=$rc"
+          fi
+        fi
+      fi
+
+      if [[ "$PHASE" == "ffuf_files" && ! -s "$FFUF_FILE_OUT" ]]; then
+        timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
+          "$FFUF_BIN" -u "$HOST/FUZZ" -w "$FFUF_FILE_WORDLIST" -t 40 -timeout 5 -rate 50 \
+          -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_FILE_OUT" >"$FFUF_FILE_LOG" 2>&1
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+          had_error=1
+          if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+            record_error "discovery" "ffuf_files" "$HOST" "timeout"
+          else
+            record_error "discovery" "ffuf_files" "$HOST" "exit_code=$rc"
+          fi
+        fi
+      fi
+    else
+      write_missing_log "[!] ffuf missing" "$FFUF_DIR_LOG" "$FFUF_FILE_LOG"
+      record_error "discovery" "$PHASE" "$HOST" "binary_missing"
+      had_error=1
     fi
-    if [[ ! -s "$FFUF_FILE_OUT" ]]; then
-      "$FFUF_BIN" -u "$HOST/FUZZ" -w "$FFUF_FILE_WORDLIST" -t 40 -timeout 5 -rate 50 \
-        -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_FILE_OUT" >"$FFUF_FILE_LOG" 2>&1 || true
-    fi
-  else
-    write_missing_log "[!] ffuf missing" "$FFUF_DIR_LOG" "$FFUF_FILE_LOG"
   fi
+
+  return $had_error
+}
+
+run_discovery_phase() {
+  local phase="$1"
+  local done_marker="$2"
+  local phase_parallel="$PARALLEL"
+
+  if is_done "$done_marker"; then
+    echo "[*] Discovery phase '$phase' already done; skipping."
+    return 0
+  fi
+
+  mapfile -t hosts < <(grep -v '^\s*$' "$WORKDIR/live_hosts.txt" 2>/dev/null || true)
+  local total="${#hosts[@]}"
+  if [[ "$total" -eq 0 ]]; then
+    echo "[!] live_hosts.txt empty; skipping discovery phase '$phase'."
+    mark_done "$done_marker"
+    return 0
+  fi
+
+  echo "[*] Running discovery phase '$phase' (parallel=$phase_parallel, hosts=$total)…"
+
+  local i=0 running=0 completed=0 failures=0
+  local start_ts now elapsed
+  start_ts="$(date +%s)"
+
+  while [[ $i -lt $total || $running -gt 0 ]]; do
+    while [[ $i -lt $total && $running -lt $phase_parallel ]]; do
+      host="${hosts[$i]}"
+      ( process_host_phase "$host" "$phase" ) &
+      i=$((i+1))
+      running=$((running+1))
+    done
+
+    if [[ $running -gt 0 ]]; then
+      if wait -n; then
+        :
+      else
+        failures=$((failures+1))
+      fi
+      completed=$((completed+1))
+      running=$((running-1))
+
+      now="$(date +%s)"
+      elapsed=$((now - start_ts))
+      if [[ $completed -eq $total || $((completed % 10)) -eq 0 ]]; then
+        echo "[*] discovery:$phase progress $completed/$total hosts, failures=$failures, elapsed=${elapsed}s"
+      fi
+    fi
+  done
+
+  record_stage_status "discovery_$phase" "completed" "hosts=$total failures=$failures"
+
+  # Backoff if too noisy
+  if [[ $failures -ge $BACKOFF_TRIGGER_FAILURES && $PARALLEL -gt 5 ]]; then
+    PARALLEL=$((PARALLEL / 2))
+    [[ $PARALLEL -lt 5 ]] && PARALLEL=5
+    echo "[!] High failure count in phase '$phase' ($failures). Backing off parallel to $PARALLEL for next phases."
+    record_stage_status "discovery_backoff" "applied" "phase=$phase failures=$failures new_parallel=$PARALLEL"
+  fi
+
+  mark_done "$done_marker"
 }
 
 export -f have_bin
 export -f is_positive_int
 export -f safe_name_for_host
 export -f write_missing_log
-export -f process_host
-export WORKDIR FFUF_BIN DIRSEARCH_BIN FFUF_DIR_WORDLIST FFUF_FILE_WORDLIST DIRSEARCH_WORDLIST
+export -f record_error
+export -f process_host_phase
+export WORKDIR FFUF_BIN DIRSEARCH_BIN FFUF_DIR_WORDLIST FFUF_FILE_WORDLIST DIRSEARCH_WORDLIST PER_HOST_TIMEOUT_SEC ERRORS_JSON
 
 if ! is_done "discovery"; then
   echo "[*] Per-host discovery (parallel=$PARALLEL)…"
-  if [[ -s "$WORKDIR/live_hosts.txt" ]]; then
-    grep -v '^\s*$' "$WORKDIR/live_hosts.txt" | xargs -r -P "$PARALLEL" -I{} bash -lc 'process_host "{}"'
-    normalize_dirsearch_reports
-    record_stage_status "discovery" "completed" "per-host dirsearch/ffuf attempted"
-  else
-    echo "[!] live_hosts.txt empty; skipping."
-    normalize_dirsearch_reports
-    record_stage_status "discovery" "skipped" "no live hosts available"
-  fi
+  run_discovery_phase "dirsearch" "discovery_dirsearch"
+  run_discovery_phase "ffuf_dirs" "discovery_ffuf_dirs"
+  run_discovery_phase "ffuf_files" "discovery_ffuf_files"
+
+  normalize_dirsearch_reports
+  record_stage_status "discovery" "completed" "per-host dirsearch/ffuf attempted"
   mark_done "discovery"
 fi
 
@@ -900,9 +1091,11 @@ fi
 
 # 7) Nuclei phase 1 (high/critical, selected tags)
 if ! is_done "nuclei_phase1"; then
-  echo "[*] Nuclei phase 1 (high/critical + selected tags)…"
+  echo "[*] Nuclei phase 1 (severity=$NUCLEI_PHASE1_SEV tags=$NUCLEI_PHASE1_TAGS)…"
   init_output_files "$WORKDIR/nuclei_phase1.txt" "$WORKDIR/nuclei_phase1.jsonl"
-  if have_bin "$NUCLEI_BIN" && [[ -s "$WORKDIR/live_hosts.txt" ]]; then
+  if [[ "$SKIP_NUCLEI" == "1" ]]; then
+    record_stage_status "nuclei_phase1" "skipped" "skip-nuclei enabled"
+  elif have_bin "$NUCLEI_BIN" && [[ -s "$WORKDIR/live_hosts.txt" ]]; then
     run_cmd "nuclei phase1 txt" "\"$NUCLEI_BIN\" -l \"$WORKDIR/live_hosts.txt\" -severity \"$NUCLEI_PHASE1_SEV\" -tags \"$NUCLEI_PHASE1_TAGS\" -silent -rl 50 -c \"$NUCLEI_CONCURRENCY\" -max-host-error \"$NUCLEI_MAX_HOST_ERROR\" -timeout 5 -retries 1 -o \"$WORKDIR/nuclei_phase1.txt\" || true"
     run_cmd "nuclei phase1 jsonl" "\"$NUCLEI_BIN\" -l \"$WORKDIR/live_hosts.txt\" -severity \"$NUCLEI_PHASE1_SEV\" -tags \"$NUCLEI_PHASE1_TAGS\" -silent -rl 50 -c \"$NUCLEI_CONCURRENCY\" -max-host-error \"$NUCLEI_MAX_HOST_ERROR\" -timeout 5 -retries 1 -jsonl -o \"$WORKDIR/nuclei_phase1.jsonl\" || true"
     record_stage_status "nuclei_phase1" "completed" "phase1 nuclei scan attempted"
@@ -1098,6 +1291,7 @@ out = {
   },
   "status": {
     "stage_status_jsonl": os.path.join(workdir,"stage_status.jsonl"),
+    "errors_jsonl": os.path.join(workdir,"errors.jsonl"),
   },
   "artifacts": {
     "ffuf_csv": gl("ffuf/*.csv"),
@@ -1131,7 +1325,11 @@ replace_in_file "$RUNFILE" "__WORKDIR__" "$WORKDIR"
 replace_in_file "$RUNFILE" "__STATE_DIR__" "$STATE_DIR"
 replace_in_file "$RUNFILE" "__COMMANDS_MD__" "$COMMANDS_MD"
 replace_in_file "$RUNFILE" "__STATUS_JSON__" "$STATUS_JSON"
+replace_in_file "$RUNFILE" "__ERRORS_JSON__" "$ERRORS_JSON"
 replace_in_file "$RUNFILE" "__PARALLEL_OVERRIDE__" "${PARALLEL_OVERRIDE:-}"
+replace_in_file "$RUNFILE" "__SKIP_NUCLEI__" "$SKIP_NUCLEI"
+replace_in_file "$RUNFILE" "__NUCLEI_SEV_OVERRIDE__" "$NUCLEI_SEV_OVERRIDE"
+replace_in_file "$RUNFILE" "__NUCLEI_TAGS_OVERRIDE__" "$NUCLEI_TAGS_OVERRIDE"
 
 replace_in_file "$RUNFILE" "__FFUF_BIN__" "$FFUF_BIN"
 replace_in_file "$RUNFILE" "__HTTPX_BIN__" "$HTTPX_BIN"
