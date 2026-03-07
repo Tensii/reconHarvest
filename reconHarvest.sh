@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# reconHarvest.sh (Kali-friendly + resumable + scope-guarded + report-heavy)
+# reconHarvest.sh (Kali-friendly + resumable + report-heavy)
 # Generates workspace + run_commands.sh always.
 #
 # Usage:
@@ -30,6 +30,10 @@ Examples:
   ./reconHarvest.sh --parallel 80 --run localhost
   ./reconHarvest.sh --resume outputs/example.com/20260218141912 --run
 EOL
+}
+
+usage_error() {
+  usage
   exit 1
 }
 
@@ -144,14 +148,13 @@ install_dirsearch_kali_safe() {
 
 install_go_tool() {
   local binary="$1"
-  local install_cmd="$2"
+  shift
   command_exists "$binary" && return 0
 
   ensure_go
   echo "[*] Installing $binary…"
   set +e
-  # shellcheck disable=SC2086
-  eval $install_cmd
+  "$@"
   local rc=$?
   set -e
 
@@ -193,47 +196,42 @@ TARGET=""
 WORKDIR=""
 PARALLEL_OVERRIDE=""
 
-if [[ $# -lt 1 ]]; then usage; fi
+if [[ $# -lt 1 ]]; then usage_error; fi
 
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
-    --run)
-      DO_RUN=1
-      shift
-      ;;
-
+    --run) DO_RUN=1; shift ;;
     --parallel)
-      [[ $# -ge 2 ]] || { echo "[!] --parallel requires a value."; usage; }
-      [[ "${2:-}" != --* ]] || { echo "[!] --parallel requires a numeric value, not another option."; usage; }
-      PARALLEL_OVERRIDE="$2"
-      is_positive_int "$PARALLEL_OVERRIDE" || { echo "[!] --parallel must be a positive integer."; usage; }
+      [[ $# -ge 2 ]] || { echo "[!] --parallel requires a value."; usage_error; }
+      [[ "${2:-}" != -* ]] || { echo "[!] --parallel requires a numeric value, not another flag."; usage_error; }
+      PARALLEL_OVERRIDE="${2:-}"
+      is_positive_int "$PARALLEL_OVERRIDE" || { echo "[!] --parallel must be a positive integer."; usage_error; }
       shift 2
       ;;
-
     --resume)
-      [[ $# -ge 2 ]] || { echo "[!] --resume requires a workdir."; usage; }
-      [[ "${2:-}" != --* ]] || { echo "[!] --resume requires a workdir, not another option."; usage; }
+      [[ $RESUME_MODE -eq 0 ]] || { echo "[!] --resume specified more than once."; usage_error; }
+      [[ -z "${TARGET:-}" ]] || { echo "[!] --resume cannot be combined with a target positional argument."; usage_error; }
+      [[ $# -ge 2 ]] || { echo "[!] --resume requires a workdir."; usage_error; }
+      [[ "${2:-}" != -* ]] || { echo "[!] --resume requires a workdir, not another flag."; usage_error; }
       RESUME_MODE=1
-      WORKDIR="$2"
+      WORKDIR="${2:-}"
       shift 2
       ;;
-
-    -h|--help)
-      usage
-      ;;
-
+    -h|--help) usage; exit 0 ;;
     --*)
-      echo "[!] Unknown option: $1"
-      usage
+      echo "[!] Unknown flag: $1"
+      usage_error
       ;;
-
     *)
-      if [[ $RESUME_MODE -eq 0 && -z "${TARGET:-}" ]]; then
-        TARGET="$1"
-      else
-        echo "[!] Unexpected extra argument: $1"
-        usage
+      if [[ $RESUME_MODE -eq 1 ]]; then
+        echo "[!] Extra positional argument not allowed with --resume: $1"
+        usage_error
       fi
+      if [[ -n "${TARGET:-}" ]]; then
+        echo "[!] Extra positional argument: $1"
+        usage_error
+      fi
+      TARGET="$1"
       shift
       ;;
   esac
@@ -248,7 +246,7 @@ if [[ $RESUME_MODE -eq 1 ]]; then
     [[ -n "${TARGET:-}" ]] || TARGET="${WORKDIR##*/}"
   fi
 else
-  [[ -n "${TARGET:-}" ]] || usage
+  [[ -n "${TARGET:-}" ]] || usage_error
   TIMESTAMP="$(date +%Y%m%d%H%M%S)"
   WORKDIR="$OUT_BASE/$TARGET/$TIMESTAMP"
   mkdir -p "$WORKDIR"
@@ -259,14 +257,14 @@ command_exists python3 || { echo "[!] python3 is required. Install python3."; ex
 
 # ---------- tool install ----------
 install_dirsearch_kali_safe
-install_go_tool "ffuf"        "go install github.com/ffuf/ffuf/v2@latest"
-install_go_tool "httpx"       "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
-install_go_tool "subfinder"   "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
-install_go_tool "assetfinder" "go install github.com/tomnomnom/assetfinder@latest"
-install_go_tool "dnsx"        "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
-install_go_tool "katana"      "go install -v github.com/projectdiscovery/katana/cmd/katana@latest"
-install_go_tool "gau"         "go install github.com/lc/gau/v2/cmd/gau@latest"
-install_go_tool "nuclei"      "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+install_go_tool "ffuf"        go install github.com/ffuf/ffuf/v2@latest
+install_go_tool "httpx"       go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+install_go_tool "subfinder"   go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+install_go_tool "assetfinder" go install github.com/tomnomnom/assetfinder@latest
+install_go_tool "dnsx"        go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+install_go_tool "katana"      go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+install_go_tool "gau"         go install github.com/lc/gau/v2/cmd/gau@latest
+install_go_tool "nuclei"      go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 
 FFUF_BIN="$(resolve_go_tool ffuf)"
 HTTPX_BIN="$(resolve_go_tool httpx)"
@@ -357,6 +355,20 @@ have_bin() {
   command -v "$b" >/dev/null 2>&1
 }
 
+is_positive_int() { [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; }
+
+safe_name_for_host() {
+  local host="$1"
+  local digest
+  digest="$(printf '%s' "$host" | sha256sum | awk '{print substr($1,1,12)}')"
+  host="$(printf '%s' "$host" | sed 's#^[A-Za-z][A-Za-z0-9+.-]*://##')"
+  host="$(printf '%s' "$host" | sed 's/[^A-Za-z0-9_.-]/_/g')"
+  host="${host#_}"
+  host="${host%%_}"
+  [[ -n "$host" ]] || host="host"
+  printf '%s__%s\n' "$host" "$digest"
+}
+
 is_done() { [[ -f "$STATE_DIR/$1.done" ]]; }
 mark_done() { : > "$STATE_DIR/$1.done"; }
 
@@ -384,6 +396,10 @@ mkdir -p "$WORKDIR/logs" "$WORKDIR/ffuf" "$WORKDIR/dirsearch" "$WORKDIR/urls" "$
 : > "$COMMANDS_MD" 2>/dev/null || true
 
 PARALLEL="${PARALLEL_OVERRIDE:-30}"
+if ! is_positive_int "$PARALLEL"; then
+  echo "[!] Invalid PARALLEL value: $PARALLEL"
+  exit 1
+fi
 
 NUCLEI_PHASE1_SEV="high,critical"
 NUCLEI_PHASE1_TAGS="cves,misconfig,login,token-spray"
@@ -443,7 +459,32 @@ if ! is_done "httpx"; then
   if have_bin "$HTTPX_BIN"; then
     run_cmd "httpx text" "\"$HTTPX_BIN\" -l \"$WORKDIR/resolved_subdomains.txt\" -silent -status-code -content-length -title -tech-detect -threads 200 -timeout 5 -retries 1 -o \"$WORKDIR/httpx_results.txt\" || true"
     run_cmd "httpx json" "\"$HTTPX_BIN\" -l \"$WORKDIR/resolved_subdomains.txt\" -silent -json -tech-detect -threads 200 -timeout 5 -retries 1 -o \"$WORKDIR/httpx_results.json\" || true"
-    awk '$2 != "400" {print $1}' "$WORKDIR/httpx_results.txt" | sed '/^$/d' > "$WORKDIR/live_hosts.txt" || true
+    python3 - "$WORKDIR/httpx_results.json" "$WORKDIR/live_hosts.txt" <<'PY' || true
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+hosts = []
+try:
+    with open(src, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            status = obj.get("status_code")
+            url = (obj.get("url") or obj.get("input") or "").strip()
+            if url and status != 400:
+                hosts.append(url)
+except FileNotFoundError:
+    pass
+with open(dst, "w", encoding="utf-8") as f:
+    for host in sorted(set(hosts)):
+        f.write(host + "\n")
+PY
+  else
+    sed '/^$/d' "$WORKDIR/resolved_subdomains.txt" > "$WORKDIR/live_hosts.txt" || true
   fi
   mark_done "httpx"
 fi
@@ -453,7 +494,7 @@ process_host() {
   local HOST="$1"
   [[ -z "$HOST" ]] && return 0
   local SAFE_NAME
-  SAFE_NAME="$(echo "$HOST" | sed 's/[^A-Za-z0-9_.-]/_/g')"
+  SAFE_NAME="$(safe_name_for_host "$HOST")"
 
   local DS_OUT="$WORKDIR/dirsearch/${SAFE_NAME}.txt"
   local FFUF_DIR_OUT="$WORKDIR/ffuf/${SAFE_NAME}.dirs.csv"
@@ -483,10 +524,13 @@ process_host() {
     fi
   else
     echo "[!] ffuf missing" >"$FFUF_DIR_LOG"
+    echo "[!] ffuf missing" >"$FFUF_FILE_LOG"
   fi
 }
 
 export -f have_bin
+export -f is_positive_int
+export -f safe_name_for_host
 export -f process_host
 export WORKDIR FFUF_BIN DIRSEARCH_BIN FFUF_DIR_WORDLIST FFUF_FILE_WORDLIST DIRSEARCH_WORDLIST
 
@@ -525,6 +569,9 @@ params_file = os.path.join(workdir, "urls", "urls_params.txt")
 out_md = os.path.join(workdir, "intel", "params_ranked.md")
 out_json = os.path.join(workdir, "intel", "params_ranked.json")
 os.makedirs(os.path.join(workdir, "intel"), exist_ok=True)
+
+def esc_md(value):
+  return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
 
 juicy = {
   "id","ids","uid","user","user_id","account","acct","email","phone",
@@ -573,8 +620,8 @@ md.append("# Parameter Ranking (Juice)\n\n")
 md.append("Scoring = frequency + juicy bonus.\n\n")
 md.append("| Param | Count | Juicy | Examples |\n|---|---:|:---:|---|\n")
 for score,k,n,isj in scored[:80]:
-  ex = "<br>".join(examples[k])
-  md.append(f"| `{k}` | {n} | {'✅' if isj else ''} | {ex} |\n")
+  ex = "<br>".join(esc_md(x) for x in examples[k])
+  md.append(f"| `{esc_md(k)}` | {n} | {'✅' if isj else ''} | {ex} |\n")
 
 open(out_md, "w", encoding="utf-8").write("".join(md))
 open(out_json, "w", encoding="utf-8").write(json.dumps({
@@ -679,6 +726,9 @@ juicy_path_kw = [
   ".git",".env","config","backup","old","dev"
 ]
 
+def esc_md(value):
+  return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
 def score_url(u):
   s=0
   lu=u.lower()
@@ -727,10 +777,13 @@ if os.path.isdir(dirsearch):
       for line in open(p,"r",encoding="utf-8",errors="ignore"):
         line=line.strip()
         if not line: continue
-        parts=line.split()
-        if len(parts) < 2: continue
-        url=parts[0]; sc=parts[1]
-        if not url: continue
+        m = re.search(r'(?P<url>https?://\S+).*?\b(?P<status>[1-5][0-9]{2})\b', line)
+        if not m:
+          m = re.search(r'(?P<status>[1-5][0-9]{2}).*?(?P<url>https?://\S+)', line)
+        if not m:
+          continue
+        url=m.group("url").rstrip(".,;")
+        sc=m.group("status")
         add=8
         if sc.startswith("2"): add+=18
         if sc.startswith("3"): add+=10
@@ -748,7 +801,7 @@ md=[]
 md.append("# Endpoint Ranking (triage)\n\n")
 md.append("| Score | URL | Sources |\n|---:|---|---|\n")
 for score,u,sources in ranked[:200]:
-  md.append(f"| {score} | {u} | {', '.join(sources)} |\n")
+  md.append(f"| {score} | {esc_md(u)} | {esc_md(', '.join(sources))} |\n")
 
 open(out_md,"w",encoding="utf-8").write("".join(md))
 open(out_json,"w",encoding="utf-8").write(json.dumps([
@@ -896,5 +949,5 @@ if [[ "$DO_RUN" -eq 1 ]]; then
 fi
 
 echo "[*] Workspace ready: $WORKDIR"
-echo "[*] To run (in-scope/lab only):"
+echo "[*] To run:"
 echo "    bash \"$RUNFILE\""
