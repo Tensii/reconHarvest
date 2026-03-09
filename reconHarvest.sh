@@ -891,6 +891,16 @@ PER_HOST_TIMEOUT_SEC="${PER_HOST_TIMEOUT_SEC:-300}"
 BACKOFF_TRIGGER_FAILURES="${BACKOFF_TRIGGER_FAILURES:-25}"
 DISCOVERY_PHASE_DEGRADED=0
 
+# Discovery scheduler settings (safe defaults for CDN/WAF-heavy targets)
+DISCOVERY_HOST_WORKERS="${DISCOVERY_HOST_WORKERS:-20}"
+FFUF_WORKERS="${FFUF_WORKERS:-8}"
+DIRSEARCH_WORKERS="${DIRSEARCH_WORKERS:-10}"
+GLOBAL_REQ_BUDGET="${GLOBAL_REQ_BUDGET:-120}"
+FFUF_MAXTIME_JOB="${FFUF_MAXTIME_JOB:-45}"
+FFUF_DELAY_RANGE="${FFUF_DELAY_RANGE:-0.03-0.12}"
+FFUF_STOP403_PCT="${FFUF_STOP403_PCT:-95}"
+FFUF_ERROR_STOP="${FFUF_ERROR_STOP:-1}"
+
 echo "[*] Recon for $TARGET"
 echo "[*] Output: $WORKDIR"
 echo "[*] Parallel: $PARALLEL"
@@ -1023,178 +1033,303 @@ PY
   mark_done "httpx"
 fi
 
-# 4) per-host discovery
-process_host_phase() {
-  local HOST="$1"
-  local PHASE="$2" # dirsearch|ffuf_dirs|ffuf_files
+# 4) central-scheduler discovery
+build_discovery_plan() {
+  python3 - "$WORKDIR/httpx_results.json" "$WORKDIR/live_hosts.txt" "$WORKDIR/intel/discovery_plan.jsonl" <<'PY' || true
+import json, re, sys
+httpx_path, live_path, out_path = sys.argv[1:4]
+meta = {}
+pat_static = re.compile(r'(?:^|[./-])(img|image|static|cdn|assets?|media)(?:[./-]|$)', re.I)
+
+try:
+  with open(httpx_path, 'r', encoding='utf-8', errors='ignore') as f:
+    for line in f:
+      line=line.strip()
+      if not line: continue
+      try: o=json.loads(line)
+      except Exception: continue
+      u=(o.get('url') or o.get('input') or '').strip()
+      if not u: continue
+      sc=int(o.get('status_code') or 0)
+      title=(o.get('title') or '')
+      tech=' '.join(o.get('tech') or [])
+      score=0
+      if sc in (200,204,301,302,307,401,403): score+=3
+      if not pat_static.search(u): score+=2
+      if any(x in (title+' '+tech).lower() for x in ['api','portal','admin','login','graphql']): score+=2
+      wafish = any(x in (title+' '+tech).lower() for x in ['akamai','cloudflare','imperva'])
+      staticish = bool(pat_static.search(u))
+      cls='promising'
+      if staticish: cls='static'
+      if wafish and score <= 3: cls='waf_heavy'
+      run_dirs = cls == 'promising'
+      meta[u] = {'score': score, 'class': cls, 'run_dirs': run_dirs, 'waf_heavy': wafish}
+except FileNotFoundError:
+  pass
+
+hosts=[]
+try:
+  with open(live_path, 'r', encoding='utf-8', errors='ignore') as f:
+    hosts=[x.strip() for x in f if x.strip()]
+except FileNotFoundError:
+  pass
+
+with open(out_path, 'w', encoding='utf-8') as out:
+  for h in hosts:
+    m=meta.get(h, {'score':1,'class':'unknown','run_dirs':True,'waf_heavy':False})
+    o={'host':h, **m}
+    out.write(json.dumps(o, ensure_ascii=False)+'\n')
+PY
+}
+
+plan_host_value() {
+  local host="$1" key="$2"
+  python3 - "$WORKDIR/intel/discovery_plan.jsonl" "$host" "$key" <<'PY' 2>/dev/null || true
+import json,sys
+p,h,k=sys.argv[1:4]
+try:
+  with open(p,'r',encoding='utf-8',errors='ignore') as f:
+    for ln in f:
+      o=json.loads(ln)
+      if o.get('host')==h:
+        v=o.get(k)
+        print(str(v).lower() if isinstance(v,bool) else v)
+        raise SystemExit(0)
+except Exception:
+  pass
+print('')
+PY
+}
+
+collect_ffuf_telemetry() {
+  local host="$1" phase="$2" csv_out="$3" log_out="$4" action="$5"
+  python3 - "$host" "$phase" "$csv_out" "$log_out" "$WORKDIR/intel/discovery_telemetry.jsonl" "$action" <<'PY' || true
+import csv, json, os, re, sys
+host, phase, csv_path, log_path, out_path, action = sys.argv[1:7]
+rows=0; matches=0; s403=0; s429=0; dur=[]
+if os.path.exists(csv_path):
+  try:
+    with open(csv_path, 'r', encoding='utf-8', errors='ignore') as f:
+      r=csv.DictReader(f)
+      for row in r:
+        rows += 1; matches += 1
+        sc=str(row.get('status_code',''))
+        if sc=='403': s403 += 1
+        if sc=='429': s429 += 1
+        d=row.get('duration','')
+        m=re.search(r'(\d+)', str(d))
+        if m: dur.append(int(m.group(1)))
+  except Exception:
+    pass
+requests_sent=0; timed_out=0
+if os.path.exists(log_path):
+  t=open(log_path,'r',encoding='utf-8',errors='ignore').read()
+  m=re.search(r'Requests\s*:\s*(\d+)', t)
+  if m: requests_sent=int(m.group(1))
+  if re.search(r'timeout|deadline exceeded|context deadline', t, re.I): timed_out=1
+avg_rt = int(sum(dur)/len(dur)) if dur else 0
+obj={
+  'host':host,'phase':phase,'requests_sent':requests_sent,'matches':matches,
+  'ratio_403': (s403/max(matches,1)), 'ratio_timeout': (timed_out/max(requests_sent,1) if requests_sent else timed_out),
+  'avg_response_time':avg_rt,'action':action
+}
+with open(out_path,'a',encoding='utf-8') as o:
+  o.write(json.dumps(obj)+'\n')
+PY
+}
+
+run_discovery_job() {
+  local HOST="$1" PHASE="$2"
   [[ -z "$HOST" ]] && return 0
-  local SAFE_NAME
+  local SAFE_NAME HOST_BASE rc=0 had_error=0
   SAFE_NAME="$(safe_name_for_host "$HOST")"
+  HOST_BASE="${HOST%/}"
 
   local DS_OUT="$WORKDIR/dirsearch/${SAFE_NAME}.txt"
   local FFUF_DIR_OUT="$WORKDIR/ffuf/${SAFE_NAME}.dirs.csv"
   local FFUF_FILE_OUT="$WORKDIR/ffuf/${SAFE_NAME}.files.csv"
-
   local DS_LOG="$WORKDIR/logs/${SAFE_NAME}.dirsearch.log"
   local FFUF_DIR_LOG="$WORKDIR/logs/${SAFE_NAME}.ffuf-dirs.log"
   local FFUF_FILE_LOG="$WORKDIR/logs/${SAFE_NAME}.ffuf-files.log"
 
-  local had_error=0 rc=0
-  local HOST_BASE="${HOST%/}"
+  local cls score waf action="completed"
+  cls="$(plan_host_value "$HOST" class)"
+  score="$(plan_host_value "$HOST" score)"
+  waf="$(plan_host_value "$HOST" waf_heavy)"
+
+  local ffuf_workers="${FFUF_WORKERS:-8}"
+  local req_budget="${GLOBAL_REQ_BUDGET:-120}"
+  local base_rate=$(( req_budget / (ffuf_workers>0?ffuf_workers:1) ))
+  [[ $base_rate -lt 8 ]] && base_rate=8
+  local ffuf_rate="$base_rate"
+  local ffuf_threads=$(( base_rate / 2 ))
+  [[ $ffuf_threads -lt 5 ]] && ffuf_threads=5
+  [[ $ffuf_threads -gt 20 ]] && ffuf_threads=20
+
+  if [[ "$cls" == "static" ]]; then
+    action="skipped"
+    collect_ffuf_telemetry "$HOST" "$PHASE" "/dev/null" "/dev/null" "$action"
+    return 0
+  fi
+  if [[ "$cls" == "waf_heavy" || "$waf" == "true" ]]; then
+    ffuf_rate=$(( ffuf_rate / 2 )); [[ $ffuf_rate -lt 5 ]] && ffuf_rate=5
+    ffuf_threads=$(( ffuf_threads / 2 )); [[ $ffuf_threads -lt 4 ]] && ffuf_threads=4
+    action="downgraded"
+  fi
 
   if [[ "$PHASE" == "dirsearch" ]]; then
-    if [[ ! -s "$DS_OUT" ]]; then
-      if have_bin "$DIRSEARCH_BIN"; then
+    if [[ ! -s "$DS_OUT" ]] && have_bin "$DIRSEARCH_BIN"; then
+      timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
+        "$DIRSEARCH_BIN" -u "$HOST" -w "$DIRSEARCH_WORDLIST" -e php,html,js,txt,asp,aspx,jsp \
+        -t 20 --timeout 8 --delay 0.08 -O plain -o "$DS_OUT" >"$DS_LOG" 2>&1 || rc=$?
+      if [[ $rc -ne 0 ]] && grep -qiE 'no such option: (-O|--output-formats|-o|--output-file)' "$DS_LOG"; then
         timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
           "$DIRSEARCH_BIN" -u "$HOST" -w "$DIRSEARCH_WORDLIST" -e php,html,js,txt,asp,aspx,jsp \
-          -t 40 --timeout 5 --delay 0.05 --plain-text-report "$DS_OUT" >"$DS_LOG" 2>&1
-        rc=$?
-        if [[ $rc -ne 0 ]]; then
-          had_error=1
-          if [[ $rc -eq 124 || $rc -eq 137 ]]; then
-            record_error "discovery" "dirsearch" "$HOST" "timeout"
-          else
-            record_error "discovery" "dirsearch" "$HOST" "exit_code=$rc"
-          fi
-        fi
-      else
-        write_missing_log "[!] dirsearch missing" "$DS_LOG"
-        record_error "discovery" "dirsearch" "$HOST" "binary_missing"
-        had_error=1
+          -t 20 --timeout 8 --delay 0.08 --plain-text-report "$DS_OUT" >"$DS_LOG" 2>&1 || rc=$?
       fi
+      [[ $rc -ne 0 ]] && had_error=1
+    fi
+  elif [[ "$PHASE" == "ffuf_dirs" ]]; then
+    [[ "$(plan_host_value "$HOST" run_dirs)" != "true" ]] && action="skipped"
+    if [[ "$action" != "skipped" && ! -s "$FFUF_DIR_OUT" && -s "$FFUF_DIR_WORDLIST" ]]; then
+      timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
+        "$FFUF_BIN" -noninteractive -u "$HOST_BASE/FUZZ" -w "$FFUF_DIR_WORDLIST" -t "$ffuf_threads" -timeout 8 -rate "$ffuf_rate" \
+        -maxtime-job "$FFUF_MAXTIME_JOB" -p "$FFUF_DELAY_RANGE" -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_DIR_OUT" \
+        >"$FFUF_DIR_LOG" 2>&1 < /dev/null || rc=$?
+      [[ $rc -ne 0 ]] && had_error=1
+      collect_ffuf_telemetry "$HOST" "$PHASE" "$FFUF_DIR_OUT" "$FFUF_DIR_LOG" "$action"
+      local ratio_403
+      ratio_403="$(python3 - "$WORKDIR/intel/discovery_telemetry.jsonl" "$HOST" "$PHASE" <<'PY' 2>/dev/null
+import json,sys
+p,h,ph=sys.argv[1:4]
+val=0.0
+for ln in open(p,'r',encoding='utf-8',errors='ignore'):
+ o=json.loads(ln)
+ if o.get('host')==h and o.get('phase')==ph: val=o.get('ratio_403',0)
+print(val)
+PY
+)"
+      if [[ -n "$ratio_403" ]] && awk "BEGIN {exit !($ratio_403*100 >= $FFUF_STOP403_PCT)}"; then
+        action="downgraded"
+      fi
+    fi
+  elif [[ "$PHASE" == "ffuf_files" ]]; then
+    local dir_hits=0
+    if [[ -s "$FFUF_DIR_OUT" ]]; then
+      dir_hits=$(awk 'END{print NR-1}' "$FFUF_DIR_OUT" 2>/dev/null || echo 0)
+    fi
+    if [[ "$dir_hits" -le 0 ]]; then
+      action="skipped"
+      collect_ffuf_telemetry "$HOST" "$PHASE" "/dev/null" "/dev/null" "$action"
+      return 0
+    fi
+    if [[ ! -s "$FFUF_FILE_OUT" && -s "$FFUF_FILE_WORDLIST" ]]; then
+      timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
+        "$FFUF_BIN" -noninteractive -u "$HOST_BASE/FUZZ" -w "$FFUF_FILE_WORDLIST" -t "$ffuf_threads" -timeout 8 -rate "$ffuf_rate" \
+        -maxtime-job "$FFUF_MAXTIME_JOB" -p "$FFUF_DELAY_RANGE" -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_FILE_OUT" \
+        >"$FFUF_FILE_LOG" 2>&1 < /dev/null || rc=$?
+      [[ $rc -ne 0 ]] && had_error=1
+      collect_ffuf_telemetry "$HOST" "$PHASE" "$FFUF_FILE_OUT" "$FFUF_FILE_LOG" "$action"
     fi
   fi
 
-  if [[ "$PHASE" == "ffuf_dirs" || "$PHASE" == "ffuf_files" ]]; then
-    if have_bin "$FFUF_BIN"; then
-      if [[ "$PHASE" == "ffuf_dirs" && ! -s "$FFUF_DIR_OUT" ]]; then
-        timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
-          "$FFUF_BIN" -u "$HOST_BASE/FUZZ" -w "$FFUF_DIR_WORDLIST" -t 40 -timeout 5 -rate 50 \
-          -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_DIR_OUT" >"$FFUF_DIR_LOG" 2>&1
-        rc=$?
-        if [[ $rc -ne 0 ]]; then
-          had_error=1
-          if [[ $rc -eq 124 || $rc -eq 137 ]]; then
-            record_error "discovery" "ffuf_dirs" "$HOST" "timeout"
-          else
-            record_error "discovery" "ffuf_dirs" "$HOST" "exit_code=$rc"
-          fi
-        fi
-      fi
-
-      if [[ "$PHASE" == "ffuf_files" && ! -s "$FFUF_FILE_OUT" ]]; then
-        timeout --signal=TERM "${PER_HOST_TIMEOUT_SEC}s" \
-          "$FFUF_BIN" -u "$HOST_BASE/FUZZ" -w "$FFUF_FILE_WORDLIST" -t 40 -timeout 5 -rate 50 \
-          -mc 200,204,301,302,307,401,403 -of csv -o "$FFUF_FILE_OUT" >"$FFUF_FILE_LOG" 2>&1
-        rc=$?
-        if [[ $rc -ne 0 ]]; then
-          had_error=1
-          if [[ $rc -eq 124 || $rc -eq 137 ]]; then
-            record_error "discovery" "ffuf_files" "$HOST" "timeout"
-          else
-            record_error "discovery" "ffuf_files" "$HOST" "exit_code=$rc"
-          fi
-        fi
-      fi
-    else
-      write_missing_log "[!] ffuf missing" "$FFUF_DIR_LOG" "$FFUF_FILE_LOG"
-      record_error "discovery" "$PHASE" "$HOST" "binary_missing"
-      had_error=1
-    fi
+  if [[ $had_error -ne 0 ]]; then
+    [[ "$PHASE" == "dirsearch" ]] && record_error "discovery" "dirsearch" "$HOST" "exit_code=$rc"
+    [[ "$PHASE" == "ffuf_dirs" ]] && record_error "discovery" "ffuf_dirs" "$HOST" "exit_code=$rc"
+    [[ "$PHASE" == "ffuf_files" ]] && record_error "discovery" "ffuf_files" "$HOST" "exit_code=$rc"
   fi
-
-  return $had_error
+  [[ $had_error -eq 0 ]]
 }
 
-run_discovery_phase() {
-  local phase="$1"
-  local done_marker="$2"
-  local phase_parallel="$PARALLEL"
-
+run_scheduled_phase() {
+  local phase="$1" done_marker="$2" workers="$3" host_file="$4"
   if is_done "$done_marker"; then
     echo "[*] Discovery phase '$phase' already done; skipping."
     return 0
   fi
-
-  mapfile -t hosts < <(grep -v '^\s*$' "$WORKDIR/live_hosts.txt" 2>/dev/null || true)
+  mapfile -t hosts < <(grep -v '^\s*$' "$host_file" 2>/dev/null || true)
   local total="${#hosts[@]}"
   if [[ "$total" -eq 0 ]]; then
-    echo "[!] live_hosts.txt empty; skipping discovery phase '$phase'."
-    mark_done "$done_marker"
-    return 0
+    echo "[!] no hosts for '$phase'; skipping."
+    mark_done "$done_marker"; return 0
   fi
-
-  echo "[*] Running discovery phase '$phase' (parallel=$phase_parallel, hosts=$total)…"
-
-  local i=0 running=0 completed=0 failures=0
-  local start_ts now elapsed
+  echo "[*] Running discovery phase '$phase' (workers=$workers, hosts=$total)…"
+  local i=0 running=0 completed=0 failures=0 start_ts now elapsed
   start_ts="$(date +%s)"
-
   while [[ $i -lt $total || $running -gt 0 ]]; do
-    while [[ $i -lt $total && $running -lt $phase_parallel ]]; do
+    while [[ $i -lt $total && $running -lt $workers ]]; do
       host="${hosts[$i]}"
-      ( process_host_phase "$host" "$phase" ) &
-      i=$((i+1))
-      running=$((running+1))
+      ( run_discovery_job "$host" "$phase" ) &
+      i=$((i+1)); running=$((running+1))
     done
-
     if [[ $running -gt 0 ]]; then
-      if wait -n; then
-        :
-      else
-        failures=$((failures+1))
-      fi
-      completed=$((completed+1))
-      running=$((running-1))
-
-      now="$(date +%s)"
-      elapsed=$((now - start_ts))
+      if wait -n; then :; else failures=$((failures+1)); fi
+      completed=$((completed+1)); running=$((running-1))
+      now="$(date +%s)"; elapsed=$((now-start_ts))
       if [[ $completed -eq $total || $((completed % 10)) -eq 0 ]]; then
         echo "[*] discovery:$phase progress $completed/$total hosts, failures=$failures, elapsed=${elapsed}s"
       fi
     fi
   done
-
   local status="completed"
-  if [[ "$failures" -gt 0 ]]; then
-    status="partial"
-  fi
+  [[ "$failures" -gt 0 ]] && status="partial"
   if [[ "$total" -gt 0 && $(( failures * 100 / total )) -ge 50 ]]; then
-    status="degraded"
-    DISCOVERY_PHASE_DEGRADED=$((DISCOVERY_PHASE_DEGRADED + 1))
+    status="degraded"; DISCOVERY_PHASE_DEGRADED=$((DISCOVERY_PHASE_DEGRADED+1))
   fi
-  record_stage_status "discovery_$phase" "$status" "hosts=$total failures=$failures"
-
-  # Backoff if too noisy
-  if [[ $failures -ge $BACKOFF_TRIGGER_FAILURES && $PARALLEL -gt 5 ]]; then
-    PARALLEL=$((PARALLEL / 2))
-    [[ $PARALLEL -lt 5 ]] && PARALLEL=5
-    echo "[!] High failure count in phase '$phase' ($failures). Backing off parallel to $PARALLEL for next phases."
-    record_stage_status "discovery_backoff" "applied" "phase=$phase failures=$failures new_parallel=$PARALLEL"
-  fi
-
+  record_stage_status "discovery_$phase" "$status" "hosts=$total failures=$failures workers=$workers"
   mark_done "$done_marker"
 }
 
+build_phase_host_lists() {
+  : > "$WORKDIR/intel/discovery_hosts_dirs.txt"
+  : > "$WORKDIR/intel/discovery_hosts_files.txt"
+  python3 - "$WORKDIR/intel/discovery_plan.jsonl" "$WORKDIR/intel/discovery_hosts_dirs.txt" <<'PY' || true
+import json,sys
+plan,out=sys.argv[1:3]
+with open(out,'w',encoding='utf-8') as o:
+  for ln in open(plan,'r',encoding='utf-8',errors='ignore'):
+    j=json.loads(ln)
+    if j.get('run_dirs',True): o.write(j.get('host','')+'\n')
+PY
+  while IFS= read -r h; do
+    [[ -n "$h" ]] || continue
+    local sname
+    sname="$(safe_name_for_host "$h")"
+    local dcsv="$WORKDIR/ffuf/${sname}.dirs.csv"
+    if [[ -s "$dcsv" ]] && awk 'END{exit !(NR>1)}' "$dcsv" 2>/dev/null; then
+      echo "$h" >> "$WORKDIR/intel/discovery_hosts_files.txt"
+    fi
+  done < "$WORKDIR/live_hosts.txt"
+  sort -u -o "$WORKDIR/intel/discovery_hosts_files.txt" "$WORKDIR/intel/discovery_hosts_files.txt" 2>/dev/null || true
+}
+
 export -f have_bin
-export -f is_positive_int
 export -f safe_name_for_host
 export -f write_missing_log
 export -f record_error
-export -f process_host_phase
-export WORKDIR FFUF_BIN DIRSEARCH_BIN FFUF_DIR_WORDLIST FFUF_FILE_WORDLIST DIRSEARCH_WORDLIST PER_HOST_TIMEOUT_SEC ERRORS_JSON
+export -f plan_host_value
+export -f collect_ffuf_telemetry
+export -f run_discovery_job
+export WORKDIR FFUF_BIN DIRSEARCH_BIN FFUF_DIR_WORDLIST FFUF_FILE_WORDLIST DIRSEARCH_WORDLIST PER_HOST_TIMEOUT_SEC ERRORS_JSON FFUF_WORKERS GLOBAL_REQ_BUDGET FFUF_MAXTIME_JOB FFUF_DELAY_RANGE FFUF_STOP403_PCT
 
 if ! is_done "discovery"; then
-  echo "[*] Per-host discovery (parallel=$PARALLEL)…"
-  run_discovery_phase "dirsearch" "discovery_dirsearch"
-  run_discovery_phase "ffuf_dirs" "discovery_ffuf_dirs"
-  run_discovery_phase "ffuf_files" "discovery_ffuf_files"
+  echo "[*] Central discovery scheduler (host_workers=$DISCOVERY_HOST_WORKERS ffuf_workers=$FFUF_WORKERS dirsearch_workers=$DIRSEARCH_WORKERS global_req_budget=$GLOBAL_REQ_BUDGET)…"
+  : > "$WORKDIR/intel/discovery_telemetry.jsonl"
+  build_discovery_plan
+
+  run_scheduled_phase "dirsearch" "discovery_dirsearch" "$DIRSEARCH_WORKERS" "$WORKDIR/live_hosts.txt"
+
+  build_phase_host_lists
+  run_scheduled_phase "ffuf_dirs" "discovery_ffuf_dirs" "$FFUF_WORKERS" "$WORKDIR/intel/discovery_hosts_dirs.txt"
+
+  build_phase_host_lists
+  run_scheduled_phase "ffuf_files" "discovery_ffuf_files" "$FFUF_WORKERS" "$WORKDIR/intel/discovery_hosts_files.txt"
 
   normalize_dirsearch_reports
   if [[ "$DISCOVERY_PHASE_DEGRADED" -gt 0 ]]; then
-    record_stage_status "discovery" "partial" "per-host discovery completed with degraded phases=$DISCOVERY_PHASE_DEGRADED"
+    record_stage_status "discovery" "partial" "central scheduler completed with degraded phases=$DISCOVERY_PHASE_DEGRADED"
   else
-    record_stage_status "discovery" "completed" "per-host dirsearch/ffuf attempted"
+    record_stage_status "discovery" "completed" "central scheduler discovery completed"
   fi
   mark_done "discovery"
 fi
